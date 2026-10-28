@@ -426,8 +426,10 @@ class SignIn(Http, unittest.TestCase):
         status, body, h = self.raw("/mcp", self.init())
         self.assertEqual(status, 401)
         self.assertIn(f'resource_metadata="{PUBLIC}/.well-known/oauth-protected-resource/mcp"', h["www-authenticate"])
-        status, prm = self.call("/.well-known/oauth-protected-resource/mcp", method="GET")
-        self.assertEqual((prm["resource"], prm["authorization_servers"]), (PUBLIC + "/mcp", [PUBLIC]))
+        # Function URLs rename that header, so clients probe these instead: the path-suffixed one, then the root.
+        for path in ("/.well-known/oauth-protected-resource/mcp", "/.well-known/oauth-protected-resource"):
+            status, prm = self.call(path, method="GET")
+            self.assertEqual((status, prm["resource"], prm["authorization_servers"]), (200, PUBLIC + "/mcp", [PUBLIC]))
         status, meta = self.call("/.well-known/oauth-authorization-server", method="GET")
         self.assertEqual(meta["issuer"], PUBLIC)
         self.assertTrue(meta["client_id_metadata_document_supported"])           # CIMD, which Claude prefers

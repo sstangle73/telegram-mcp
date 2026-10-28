@@ -49,6 +49,7 @@ SCRYPT = {"n": 2 ** 15, "r": 8, "p": 1}
 REQUEST_SECONDS, CODE_SECONDS = 600, 300
 LOCKOUT_FAILURES, LOCKOUT_SECONDS = 10, 900
 METADATA_PATH = "/.well-known/oauth-authorization-server"
+RESOURCE_PATH = "/.well-known/oauth-protected-resource"
 
 log = logging.getLogger("telegram-mcp")
 
@@ -387,7 +388,10 @@ class Provider:
 
     def install(self, app) -> None:
         """Swap the SDK's metadata route for one advertising CIMD, which Claude uses only when the metadata says
-        client_id_metadata_document_supported and accepts public clients ("none")."""
+        client_id_metadata_document_supported and accepts public clients ("none"). And serve the protected resource
+        metadata at the root as well as at /.well-known/oauth-protected-resource/mcp: Lambda Function URLs rename the
+        401's WWW-Authenticate header (x-amzn-Remapped-www-authenticate), so clients find sign-in by probing those two
+        paths instead, path-suffixed first."""
         settings_ = self.auth_settings()
         m = build_metadata(settings_.issuer_url, None, settings_.client_registration_options,
                            settings_.revocation_options)
@@ -399,6 +403,8 @@ class Provider:
             return JSONResponse(doc, headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "max-age=300"})
         app.router.routes = [Route(METADATA_PATH, metadata, methods=["GET", "OPTIONS"])
                              if getattr(r, "path", None) == METADATA_PATH else r for r in app.router.routes]
+        prm = next(r for r in app.router.routes if getattr(r, "path", "").startswith(RESOURCE_PATH + "/"))
+        app.router.routes.append(Route(RESOURCE_PATH, prm.endpoint, methods=["GET", "OPTIONS"]))
 
     def _locked(self) -> bool:
         now = time.time()

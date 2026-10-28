@@ -88,11 +88,13 @@ Free for personal use within Lambda's free tier (1 million requests and 400,000 
 
 It stores the secrets in SSM Parameter Store under `/telegram-mcp/`, as SecureStrings apart from the API ID. Without `--signin-file` it makes an `AUTH_TOKEN` instead. Then it creates:
 - an IAM role that can read only those parameters and write the function's logs
-- the function: Python 3.14 on arm64, 512 MB, 60 s, reserved concurrency 2, logs kept 30 days
+- the function: Python 3.14 on arm64, 512 MB, 60 s, logs kept 30 days, and reserved concurrency 2 where the account has room (below)
 - a Function URL, with `PUBLIC_URL` and `ALLOWED_HOSTS` set to match
 
 `--url` prints the connector URL and puts it on your clipboard. Delete `data/session.txt` and `data/signin.env` afterwards unless you run a local copy too.
 
+- **Concurrency on a new account:** a new AWS account may run 10 Lambda calls at once, and Lambda keeps 10 unreserved, so there's none to reserve. `deploy.py` says so and carries on, and the account's limit of 10 is the cap instead. Ask for a higher limit in Service Quotas if you want the cap of 2.
+- **How Claude finds sign-in here:** Function URLs rename the 401's `WWW-Authenticate` header to `x-amzn-Remapped-www-authenticate`. Clients then look for sign-in at `/.well-known/oauth-protected-resource/mcp` and `/.well-known/oauth-protected-resource`, and the server answers at both. claude.ai signs in this way.
 - **Without IAM rights:** [aws/deploy-policy.json](aws/deploy-policy.json) is all a deployer needs once the role exists. Someone who may manage IAM creates the role once with `deploy.py --apply --only-role`.
 - **Later:**
   - `--apply` after pulling a change.

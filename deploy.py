@@ -28,7 +28,8 @@ What it manages:
     anything your Telegram account can. Nothing here prints it, the token or the sign-in secrets.
   - IAM role <name>-lambda: its logs, and reading its own parameters. Deploying with credentials that can't manage
     IAM (aws/deploy-policy.json is such a policy)? Have someone who can run --only-role once.
-  - Lambda function <name> (python3.14, arm64, 512 MB, 60 s), reserved concurrency 2, logs kept 30 days.
+  - Lambda function <name> (python3.14, arm64, 512 MB, 60 s), logs kept 30 days, and reserved concurrency 2 where
+    the account has room (a new account's limit of 10 leaves none to reserve, so that limit is the cap).
   - Its Function URL (auth NONE: the server checks sign-in and the token itself), the two public permissions a URL
     needs, and the PUBLIC_URL and ALLOWED_HOSTS that match it.
 Whoever can replace the function's code can reach the session through it, so treat deploy credentials accordingly.
@@ -397,7 +398,9 @@ def main():
             try:
                 lam.put_function_concurrency(FunctionName=name, ReservedConcurrentExecutions=2)
             except ClientError as e:   # accounts with a low concurrency quota can't reserve any
-                print(f"  could not reserve concurrency ({code(e)}): {e.response['Error']['Message']}")
+                print(f"  could not reserve concurrency ({code(e)}): {e.response['Error']['Message']}\n"
+                      "  On a new account (a limit of 10, which Lambda keeps unreserved) that's expected: the account's "
+                      "limit is the cap instead. Service Quotas can raise it.")
     group = f"/aws/lambda/{name}"
     found = [g for g in logs.describe_log_groups(logGroupNamePrefix=group)["logGroups"] if g["logGroupName"] == group]
     if not found or found[0].get("retentionInDays") != 30:
