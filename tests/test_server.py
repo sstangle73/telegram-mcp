@@ -236,6 +236,15 @@ class Login(unittest.IsolatedAsyncioTestCase):
                               ("07700 900123", "44", "+447700900123")):
             self.assertEqual(login.international(raw, cc), want, raw)
 
+    def test_api_credentials_come_from_the_environment_then_env_file(self):
+        import login
+        env = Path(tempfile.mkdtemp()) / ".env"
+        env.write_text("# from my.telegram.org\nAPI_ID=777\nAPI_HASH='abc'\nAUTH_TOKEN=\n")
+        with environment(API_ID=None, API_HASH=None, AUTH_TOKEN=None):
+            self.assertEqual((login.setting("API_ID", env), login.setting("API_HASH", env)), ("777", "abc"))
+            self.assertIsNone(login.setting("AUTH_TOKEN", env))
+        self.assertEqual(login.setting("API_ID", env), "12345")   # the environment wins
+
     async def test_an_invalid_number_is_asked_again(self):
         import login
         from telethon import errors
@@ -295,6 +304,14 @@ class SetupSignin(unittest.TestCase):
             self.assertIsNotNone(server.config().signin)
         with self.assertRaises(SystemExit):   # and it never overwrites one
             self.run_it(PASSWORD.encode() + b"\n", out)
+
+    def test_the_file_goes_beside_the_session_by_default(self):
+        import importlib
+        import setup_signin
+        for session_file, want in (("/data/session.txt", "/data/signin.env"), (None, "data/signin.env")):
+            with environment(TELEGRAM_SESSION_FILE=session_file):
+                self.assertEqual(Path(importlib.reload(setup_signin).OUT), Path(want))   # the image: its volume
+        importlib.reload(setup_signin)
 
     def test_a_short_or_missing_password_is_refused(self):
         for stdin in (b"short\r\n", b""):

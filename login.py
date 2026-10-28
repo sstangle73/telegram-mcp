@@ -1,6 +1,6 @@
 """One-time sign-in: makes the Telegram session string server.py uses, and writes it to a file (never the screen).
 
-    python login.py                          API_ID and API_HASH from the environment, or asked for
+    python login.py                          API_ID and API_HASH from the environment or .env, or asked for
     python login.py --out data/session.txt   the default, or TELEGRAM_SESSION_FILE
     python login.py --country-code 44        for a phone number typed without +44 (the default is 1: US, Canada)
     docker compose run --rm telegram-mcp python login.py      the same, inside the container, into ./data
@@ -16,11 +16,24 @@ import getpass
 import os
 import re
 import sys
+from pathlib import Path
 
 from telethon import TelegramClient, errors, utils
 from telethon.sessions import StringSession
 
 DEVICE = {"device_model": "telegram-mcp", "system_version": "Claude connector", "app_version": "1.0"}   # server.py's
+
+
+def setting(name: str, env: Path = Path(__file__).resolve().with_name(".env")) -> str | None:
+    """From the environment, else from the .env beside this script (KEY=value lines), as deploy.py reads it."""
+    if os.environ.get(name):
+        return os.environ[name]
+    if env.exists():
+        for line in env.read_text(encoding="utf-8").splitlines():
+            k, sep, v = line.strip().partition("=")
+            if sep and k == name and v.strip():
+                return v.strip().strip("\"'")
+    return None
 
 
 def international(raw: str, country_code: str) -> str:
@@ -49,8 +62,8 @@ async def main() -> None:
         sys.exit(f"{args.out} already exists, and may be a live session: move it away (or end that session in "
                  "Telegram's Settings > Devices) first")
 
-    api_id = os.environ.get("API_ID") or input("API ID (my.telegram.org > API development tools): ").strip()
-    api_hash = os.environ.get("API_HASH") or getpass.getpass("API hash (hidden): ").strip()
+    api_id = setting("API_ID") or input("API ID (my.telegram.org > API development tools): ").strip()
+    api_hash = setting("API_HASH") or getpass.getpass("API hash (hidden): ").strip()
     client = TelegramClient(StringSession(), int(api_id), api_hash, receive_updates=False, **DEVICE)
     while True:
         phone = international(input(f"Phone number (+{cc} unless you type another +country code): "), cc)

@@ -1,6 +1,6 @@
 """Set up sign-in: the password and authenticator code you sign in to this server with from Claude. Run it yourself.
 
-    python setup_signin.py                    writes data/signin.env
+    python setup_signin.py                    writes data/signin.env (beside TELEGRAM_SESSION_FILE, if that's set)
     docker compose run --rm telegram-mcp python setup_signin.py      the same, inside the container, into ./data
     <password manager> | python setup_signin.py --password-stdin     no questions: for a script (below)
 
@@ -25,6 +25,8 @@ from urllib.parse import quote
 import oauth
 
 TOTP = "SHA-1, 6 digits, every 30 seconds"   # what oauth.totp checks: every app's default
+# Next to the Telegram session: data/signin.env, or /data/signin.env in the image (its mounted volume).
+OUT = os.path.join(os.path.dirname(os.environ.get("TELEGRAM_SESSION_FILE", "data/session.txt")) or ".", "signin.env")
 
 
 def ask(label: str) -> tuple[str, str]:
@@ -63,7 +65,7 @@ def from_stdin() -> tuple[str, str]:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--out", default="data/signin.env")
+    ap.add_argument("--out", default=OUT, help=f"default {OUT}")
     ap.add_argument("--label", default="telegram-mcp", help="the name your authenticator app shows for it")
     ap.add_argument("--password-stdin", action="store_true",
                     help="read the password from stdin's first line and ask nothing: the caller adds TOTP_SECRET "

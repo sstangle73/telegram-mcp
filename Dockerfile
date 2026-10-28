@@ -11,8 +11,8 @@ COPY requirements.txt .
 RUN pip install -r requirements.txt
 COPY server.py oauth.py login.py setup_signin.py ./
 
-# A uid no host account has. The server writes nothing; login.py and setup_signin.py write ./data, so on Linux:
-# chown 10790 data.
+# A uid no host account has. The server writes nothing; login.py and setup_signin.py write /data (./data with
+# compose), so on Linux: sudo chown 10790 data. .dockerignore keeps .env and data/ out of the build context.
 USER 10790:10790
 EXPOSE 8000
 HEALTHCHECK --interval=60s --timeout=5s --retries=3 \

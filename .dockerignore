@@ -1,0 +1,15 @@
+# Kept out of the build context, which some hosts upload to a remote builder: secrets never belong there, and the
+# Dockerfile copies only the files it names.
+.env
+data/
+*.session
+*.session-journal
+session.txt
+signin.env
+connector-url.txt
+.git/
+.venv/
+build/
+tests/
+__pycache__/
+*.pyc

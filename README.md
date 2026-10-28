@@ -1,6 +1,6 @@
 # telegram-mcp
 
-An MCP server that lets Claude read your Telegram chats and send a message when you ask it to. It signs in as your own account through [Telethon](https://docs.telethon.dev) (Telegram's client API, not a bot). It runs wherever you like behind HTTPS: on AWS Lambda's free tier with one script, on any host that runs a container, or on your own server. claude.ai, Claude Desktop, Claude mobile and Claude Code can all reach it.
+An MCP server that lets Claude read your Telegram chats and send a message when you ask it to. It signs in as your own account through [Telethon](https://docs.telethon.dev) (Telegram's client API, not a bot). You run your own copy behind HTTPS: on AWS Lambda's free tier with one script, on any host that runs a container, or on your own server. claude.ai, Claude Desktop, Claude mobile and Claude Code can all reach it.
 
 | Tool | What it does |
 |---|---|
@@ -11,7 +11,37 @@ An MCP server that lets Claude read your Telegram chats and send a message when 
 
 There's no edit, delete, forward, join, leave or mark-read, and reading marks nothing as read.
 
-**One deployment is one Telegram account**, and only its owner can get in. Everyone who wants this runs their own copy.
+**One deployment is one Telegram account**, and only its owner can get in. There's no shared service: everyone who wants this runs their own copy.
+
+**Contents:** [What you need](#what-you-need) · [Quick start](#quick-start-aws-lambda-and-claudeai) · [How Claude gets in](#how-claude-gets-in) · [Prompt injection](#prompt-injection-and-what-guards-against-it) · [Step by step](#1-telegram-api-credentials) · [Try it](#try-it) · [Check it](#check-it-from-a-terminal) · [Update](#keeping-it-up-to-date) · [Remove](#removing-it) · [Troubleshooting](#troubleshooting) · [Settings](#settings) · [Development](#development)
+
+## What you need
+
+- **A Telegram account**, and its phone nearby for the login code.
+- **Python 3.12 or later** on your computer, for the one-time sign-ins and the Lambda deploy (tested on 3.14). Docker can stand in for it on options B and C.
+- **Somewhere to run it with HTTPS**: an AWS account (option A, scripted), any container host (B) or your own server (C).
+- **Claude**: any plan with custom connectors (the Free plan allows one) or Claude Code.
+
+## Quick start: AWS Lambda and claude.ai
+
+This is the tested path. Each step is explained further down.
+
+```sh
+git clone https://gitlab.com/sstangle73/telegram-mcp.git
+cd telegram-mcp
+python -m venv .venv
+.venv/bin/pip install -r requirements.txt boto3
+cp .env.example .env                  # then put your API_ID and API_HASH in .env (step 1)
+.venv/bin/python login.py             # sign in to Telegram once (step 2)
+.venv/bin/python setup_signin.py      # your password and authenticator for this server (step 3)
+.venv/bin/python deploy.py --apply --session-file data/session.txt --signin-file data/signin.env
+.venv/bin/python deploy.py --url      # prints https://<id>.lambda-url.<region>.on.aws/mcp
+rm data/session.txt data/signin.env   # AWS has them now
+```
+
+On Windows, use `.venv\Scripts\python` and `.venv\Scripts\pip`, `copy` for `cp` and `del` for `rm`. `deploy.py` needs AWS credentials on your computer first ([step 4A](#a-aws-lambda-scripted)).
+
+Then in claude.ai, go to **Customize > Connectors > Add custom connector**, paste the URL, choose **Sign in now**, and sign in with your password and authenticator code. Keep `send_message` on **Needs approval**.
 
 ## How Claude gets in
 
@@ -36,15 +66,15 @@ What none of this stops: approving a bad send without reading it, a leaked token
 
 ## 1. Telegram API credentials
 
-At [my.telegram.org](https://my.telegram.org), sign in with your phone number, open **API development tools** and create an application (any title, platform *Other*). Copy `.env.example` to `.env`, and put its `api_id` and `api_hash` there.
+At [my.telegram.org](https://my.telegram.org), sign in with your phone number, open **API development tools** and create an application (any title and short name, platform *Other*). Copy `.env.example` to `.env`, and put its `api_id` and `api_hash` there as `API_ID` and `API_HASH`.
+
+If the page answers only "ERROR" when you create the application, try again later, or without a VPN or ad blocker.
 
 ## 2. Sign in to Telegram once
 
-You need Python 3.12 or later (tested on 3.14).
-
 ```sh
 python -m venv .venv
-.venv/bin/pip install -r requirements.txt boto3      # Windows: .venv\Scripts\pip; boto3 is only for deploy.py
+.venv/bin/pip install -r requirements.txt boto3      # boto3 is only for deploy.py
 .venv/bin/python login.py
 ```
 
@@ -76,14 +106,14 @@ Every option runs the same `server.py` and takes the same settings:
 | `LOGIN_PASSWORD_HASH`, `TOTP_SECRET`, `SIGNING_KEY` | For sign-in: from step 3 |
 | `AUTH_TOKEN` | For a static token: 32+ random URL-safe characters, `python -c "import secrets; print(secrets.token_urlsafe(32))"` |
 
-Treat the session and the sign-in secrets like passwords: use your host's secret store, not a plain environment variable that others can read. Requests must carry `PUBLIC_URL`'s host name (or one in `ALLOWED_HOSTS`): others get 421. Your connector URL is then `https://<your host>/mcp`, or `https://<your host>/<AUTH_TOKEN>/mcp` with a token.
+Treat the session and the sign-in secrets like passwords: use your host's secret store, not a plain environment variable that others can read. Your connector URL is then `https://<your host>/mcp`, or `https://<your host>/<AUTH_TOKEN>/mcp` with a token.
 
 ### A. AWS Lambda, scripted
 
-Free for personal use within Lambda's free tier (1 million requests and 400,000 GB-seconds a month), and `deploy.py` does all of it. It uses boto3's usual credentials (`AWS_PROFILE`, environment variables, SSO; or `--profile`) and region (or `--region`, else `us-east-1`), and is a dry run until `--apply`:
+Free for personal use within Lambda's free tier (1 million requests and 400,000 GB-seconds a month), and `deploy.py` does all of it. It uses boto3's usual [credentials](https://boto3.amazonaws.com/v1/documentation/api/latest/guide/credentials.html): `aws configure`, `aws sso login`, `AWS_PROFILE` or environment variables, or `--profile`. The region is `--region`, else your AWS config's, else `us-east-1`. It's a dry run until `--apply`:
 
 ```sh
-.venv/bin/python deploy.py
+.venv/bin/python deploy.py                    # what it would do
 .venv/bin/python deploy.py --apply --session-file data/session.txt --signin-file data/signin.env
 .venv/bin/python deploy.py --url
 ```
@@ -97,7 +127,7 @@ It stores the secrets in SSM Parameter Store under `/telegram-mcp/`, as SecureSt
 
 - **Concurrency on a new account:** a new AWS account may run 10 Lambda calls at once, and Lambda keeps 10 unreserved, so there's none to reserve. `deploy.py` says so and carries on, and the account's limit of 10 is the cap instead. Ask for a higher limit in Service Quotas if you want the cap of 2.
 - **How Claude finds sign-in here:** Function URLs rename the 401's `WWW-Authenticate` header to `x-amzn-Remapped-www-authenticate`. Clients then look for sign-in at `/.well-known/oauth-protected-resource/mcp` and `/.well-known/oauth-protected-resource`, and the server answers at both. claude.ai signs in this way.
-- **Without IAM rights:** [aws/deploy-policy.json](aws/deploy-policy.json) is all a deployer needs once the role exists. Someone who may manage IAM creates the role once with `deploy.py --apply --only-role`.
+- **Without IAM rights:** [aws/deploy-policy.json](aws/deploy-policy.json) is all a deployer needs once the role exists. Someone who may manage IAM creates the role once with `deploy.py --apply --only-role`. With `--name`, replace `telegram-mcp` in that policy with your name.
 - **Later:**
   - `--apply` after pulling a change.
   - `--apply --signin-file data/signin.env` after running `setup_signin.py` again.
@@ -108,16 +138,19 @@ It stores the secrets in SSM Parameter Store under `/telegram-mcp/`, as SecureSt
 
 ### B. Any container host
 
-Build the image from the `Dockerfile` with `docker build -t telegram-mcp .`, or let your host build it from the repo. Run it with the settings above as secrets or environment variables. Examples are Google Cloud Run, Fly.io, Render, Railway, or Kubernetes.
+Build the image from the `Dockerfile` with `docker build -t telegram-mcp .`, or let your host build it from the repo. Run it with the settings above as secrets or environment variables, and `PUBLIC_URL` set to the address the host gives it. Google Cloud Run, Fly.io, Render, Railway and Kubernetes should all work; none of them has been tried.
 
 - It listens on `PORT` (default `8000`) on all interfaces, and runs as an unprivileged user (uid 10790) that needs no writable filesystem.
 - Point the host's health check at `/healthz`, which answers anyone.
-- Your host must give it HTTPS. With sign-in, set `PUBLIC_URL` to the address Claude will use. With a token, don't log request paths.
-- Run one instance if you can. More work, with two caveats: each instance keeps its own memory of used codes and failed sign-ins, so those checks are looser. The send limit is counted in Telegram, so it holds across instances.
+- Your host must give it HTTPS. With a token, don't log request paths.
+- Run one instance if you can. More work, with one caveat: each instance keeps its own memory of used codes and failed sign-ins, so those checks are looser. The send limit is counted in Telegram, so it holds across instances.
+- `.dockerignore` keeps `.env` and `data/` out of the build context, so a host that builds remotely never uploads them.
 
 ### C. Your own server
 
-`docker compose up -d` serves it on `127.0.0.1:8790`. It reads `.env`, `data/signin.env` once `setup_signin.py` has made it, and the session file in `./data`. Then put HTTPS in front with a reverse proxy, or with a tunnel (Cloudflare Tunnel, Tailscale Funnel), and set `PUBLIC_URL` to the public address. For nginx, inside your HTTPS `server` block:
+`docker compose up -d` builds the image and serves it on `127.0.0.1:8790`. It reads `.env`, `data/signin.env` once `setup_signin.py` has made it, and the session file in `./data`. It needs Docker Compose 2.24 or later. On Linux, first let the container's user write `./data`: `mkdir -p data && sudo chown 10790 data`.
+
+Then put HTTPS in front with a reverse proxy, or with a tunnel (Cloudflare Tunnel, Tailscale Funnel), and set `PUBLIC_URL` in `.env` to the public address. For nginx, inside your HTTPS `server` block:
 
 ```nginx
 location / {
@@ -128,15 +161,83 @@ location / {
 }
 ```
 
-Caddy's `reverse_proxy 127.0.0.1:8790` does the same, and Caddy writes no access log unless you ask for one. On loopback alone, without a proxy, Claude Code can sign in at `http://127.0.0.1:8790/mcp` with `PUBLIC_URL=http://127.0.0.1:8790`, or use the token URL. Without Docker, `.venv/bin/python server.py` serves on port 8000.
+Caddy's `reverse_proxy 127.0.0.1:8790` does the same, and Caddy writes no access log unless you ask for one.
+
+Without Docker, `.venv/bin/python server.py` serves on `127.0.0.1:8000` (`HOST` and `PORT` change that), reading the same settings from the environment. On loopback alone, without a proxy, Claude Code can sign in at `http://127.0.0.1:8790/mcp` with `PUBLIC_URL=http://127.0.0.1:8790`, or use the token URL.
 
 ## 5. Add it to Claude
 
-- **claude.ai, Desktop, mobile:** go to **Customize > Connectors > Add custom connector**. Give it any name.
+- **claude.ai** (and with it Claude Desktop and the mobile apps, which use your account's connectors): go to **Customize > Connectors > Add custom connector**. Give it any name.
   - With sign-in: enter `https://<host>/mcp`, choose **Sign in now**, and choose **Use Claude's published identity** (*Register automatically* works too). Leave the client ID empty. Claude opens the sign-in page: enter your password, then the code from your app.
   - With a token: enter the token URL and choose **No sign-in**.
   - Either way, keep `send_message` on **Needs approval** in the connector's tool permissions. The read tools can be *Always allow*.
-- **Claude Code:** run `claude mcp add --transport http telegram https://<host>/mcp`, then `/mcp` to sign in, which opens the page in your browser. Or add the token URL.
+- **Claude Code:** run `claude mcp add --transport http telegram https://<host>/mcp`, then `/mcp` in Claude Code to sign in, which opens the page in your browser. Or add the token URL.
+- **Other MCP clients** should work if they speak streamable HTTP and either the MCP authorization spec (OAuth 2.1 with PKCE) or a bearer header with `AUTH_TOKEN`. For OAuth, add their redirect URI to `REDIRECT_URIS` (loopback ones match any port), and the host of their client metadata document, if they use one, to `CLIENT_METADATA_HOSTS`.
+
+## Try it
+
+Ask Claude things like:
+
+- "What's unread in my Telegram? Summarize each chat."
+- "What did Alex say in the Family group this week?"
+- "Search my Telegram for the flight confirmation."
+- "Tell Alex on Telegram that I'm running 10 minutes late."
+
+For the last one, Claude asks you to approve `send_message`, showing the chat and the text. Once you do, the message goes out as you, and a copy tagged `#claude_sent` lands in your Saved Messages.
+
+## Check it from a terminal
+
+With sign-in set up, these show the server is up and points clients at its sign-in:
+
+```sh
+curl https://<host>/healthz                                          # ok
+curl -i -X POST https://<host>/mcp                                   # 401
+curl https://<host>/.well-known/oauth-protected-resource/mcp         # "resource": "https://<host>/mcp"
+curl https://<host>/.well-known/oauth-authorization-server           # "issuer": "https://<host>"
+```
+
+The `resource` must be exactly the URL you add in Claude: `PUBLIC_URL` plus `/mcp`, with no trailing slash.
+
+## Keeping it up to date
+
+`git pull`, then redeploy: `deploy.py --apply` on Lambda, `docker compose up -d --build` with compose, or your host's rebuild. Your sign-in and session carry over. Watch the repository for releases to hear about fixes.
+
+## Removing it
+
+1. In Claude, remove the connector.
+2. In Telegram, end the *telegram-mcp* session under **Settings > Devices**. That alone cuts off the server, whatever else happens to it.
+3. Remove what you deployed. On Lambda, with the same credentials and region:
+   ```sh
+   aws lambda delete-function --function-name telegram-mcp
+   aws ssm delete-parameters --names /telegram-mcp/api-id /telegram-mcp/api-hash /telegram-mcp/session /telegram-mcp/auth-token /telegram-mcp/login-password-hash /telegram-mcp/totp-secret /telegram-mcp/signing-key
+   aws iam delete-role-policy --role-name telegram-mcp-lambda --policy-name telegram-mcp-lambda
+   aws iam delete-role --role-name telegram-mcp-lambda
+   aws logs delete-log-group --log-group-name /aws/lambda/telegram-mcp
+   ```
+   Deleting the function deletes its URL with it. With compose: `docker compose down --rmi local`, then delete `data/` and `.env`.
+4. Optionally, delete the application at [my.telegram.org](https://my.telegram.org) and the authenticator entry.
+
+## Troubleshooting
+
+**Logs** say most of what goes wrong: `aws logs tail /aws/lambda/telegram-mcp --since 1h` on Lambda, `docker compose logs -f` with compose. The server's own log lines carry ids and counts, never secrets or message text.
+
+| What you see | What to do |
+|---|---|
+| The server won't start, or Lambda answers 502 | The log names the missing or malformed setting: `API_ID and API_HASH are required`, `no Telegram session`, `no way in` (neither sign-in nor `AUTH_TOKEN` is set), `sign-in needs PUBLIC_URL`, and so on. |
+| Claude says it couldn't reach the server, or never offers to sign in | Run the [terminal checks](#check-it-from-a-terminal). `/mcp` must answer 401, and `resource` must equal the URL you added in Claude. |
+| The sign-in page says the link has expired or isn't valid | It's good for 10 minutes, and changing the sign-in secrets voids it. Start again from Claude. |
+| "Wrong password or code" | Check the device clock where your authenticator runs: codes are good for 30 seconds either side, and each works once. |
+| "Too many failed sign-ins" | Wait 15 minutes. Restarting the server clears it too. |
+| You signed in, but Claude still reports a failure | Look in the log for `client metadata ... refused` or `unreadable`: the server couldn't read Claude's published identity. Remove the connector and add it again with **Register automatically**, since a connector's sign-in settings can't be changed once added. |
+| Claude asks you to sign in again after a month | That's `SIGNIN_DAYS` (30). Raise it if you like. |
+| A tool says "The Telegram session is signed out" | The session was ended in Telegram, or Telegram ended it. Run `login.py` again, then `deploy.py --apply --session-file data/session.txt`, or replace `data/session.txt` and restart. |
+| "Not sent: ... the limit is 20" | `SEND_LIMIT_PER_HOUR` at work. Sends to Saved Messages don't count. |
+| "Several chats match" or "No chat named ..." | Use the id from `list_dialogs`. Blocked chats are hidden on purpose. |
+| 421 "Invalid Host header" | Requests must carry `PUBLIC_URL`'s host name. Behind a proxy, pass it on (nginx: `proxy_set_header Host $host`), or list the name in `ALLOWED_HOSTS`. |
+| Everything answers 404 | Without sign-in, only the token URL works. Check the token, and that the path ends in `/mcp`. |
+| `login.py` stops with `FloodWaitError` | Telegram is rate-limiting sign-ins: wait the number of seconds it gives. |
+| `PermissionError` writing `/data/...` (Docker on Linux) | `sudo chown 10790 data`. |
+| Compose complains about `data/signin.env` | Docker Compose older than 2.24 can't skip a missing file: update it, or remove that entry while you use only a token. |
 
 ## Settings
 
@@ -162,7 +263,7 @@ Caddy's `reverse_proxy 127.0.0.1:8790` does the same, and Caddy writes no access
 .venv/bin/python -m unittest discover -s tests
 ```
 
-The tests run the guards against a fake Telegram. They also run the token gate, the whole sign-in (discovery, both client types, the page, codes, tokens and refresh) and the MCP SDK through the Lambda handler. `requirements.txt` pins every package, and both the image and the Lambda zip are built from it.
+The tests run the guards against a fake Telegram. They also run the token gate, the whole sign-in (discovery, both client types, the page, codes, tokens and refresh), `login.py` and `setup_signin.py`, and the MCP SDK through the Lambda handler. `requirements.txt` pins every package, and both the image and the Lambda zip are built from it. Issues and merge requests on GitLab are welcome; for anything security-related, see below first.
 
 | File | What it is |
 |---|---|
