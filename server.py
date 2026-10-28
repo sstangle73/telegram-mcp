@@ -1,8 +1,9 @@
 """Telegram MCP server: Claude reads your Telegram chats, and sends a message when you ask it to.
 
 It talks to Telegram as your own account (Telethon, the client API, not a bot), from the session string login.py
-makes. AWS Lambda runs it behind a Function URL (lambda_handler.py, deployed by deploy.py); `python server.py` or
-`docker compose up` runs it locally under uvicorn.
+makes. Anything that runs a container or `python server.py` (uvicorn) can host it, behind HTTPS. On AWS Lambda,
+lambda_handler.py is the entry point and deploy.py does the rest. Secrets come from the environment (API_ID,
+API_HASH, AUTH_TOKEN, and TELEGRAM_SESSION or TELEGRAM_SESSION_FILE), or from SSM when SSM_PREFIX is set.
 
 Auth: the token is either the first path segment, https://<host>/<token>/mcp (all a claude.ai custom connector can
 send), or a bearer header on /mcp. Anything else gets 404.
@@ -78,12 +79,15 @@ def _from_ssm(prefix: str) -> dict[str, str]:
 
 
 def _from_env() -> dict[str, str]:
-    path = os.environ.get("TELEGRAM_SESSION_FILE", "data/session.txt")
-    try:
-        with open(path, encoding="utf-8") as f:
-            session = f.read().strip()
-    except FileNotFoundError:
-        raise SystemExit(f"no Telegram session at {path}: run login.py first") from None
+    """The secrets from the environment, as container hosts pass them; the session may be a file instead."""
+    session = os.environ.get("TELEGRAM_SESSION", "").strip()
+    if not session:
+        path = os.environ.get("TELEGRAM_SESSION_FILE", "data/session.txt")
+        try:
+            with open(path, encoding="utf-8") as f:
+                session = f.read().strip()
+        except FileNotFoundError:
+            raise SystemExit(f"no Telegram session: set TELEGRAM_SESSION, or run login.py to make {path}") from None
     return {"api-id": os.environ.get("API_ID", ""), "api-hash": os.environ.get("API_HASH", ""), "session": session,
             "auth-token": os.environ.get("AUTH_TOKEN", "")}
 

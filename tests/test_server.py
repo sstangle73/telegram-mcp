@@ -149,6 +149,21 @@ class Tools(unittest.IsolatedAsyncioTestCase):
             await server.read_messages("Ali")
 
 
+class Config(unittest.TestCase):
+    def tearDown(self):
+        os.environ.pop("TELEGRAM_SESSION", None)
+        server.config.cache_clear()
+
+    def test_session_from_the_environment_wins_over_the_file(self):
+        os.environ["TELEGRAM_SESSION"] = "2" * 353
+        server.config.cache_clear()
+        self.assertEqual(server.config().session, "2" * 353)
+
+    def test_session_from_the_file_otherwise(self):
+        server.config.cache_clear()
+        self.assertEqual(server.config().session, "1" * 353)
+
+
 class OverTheFunctionUrl(unittest.TestCase):
     """The Lambda handler, the token gate and the MCP SDK together, as a Function URL would call them."""
 

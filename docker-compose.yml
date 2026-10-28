@@ -1,6 +1,7 @@
-# The Telegram MCP server on this machine: http://127.0.0.1:8790/<AUTH_TOKEN>/mcp, or /mcp with a bearer header.
-# The copy claude.ai uses is the AWS Lambda that deploy.py makes; this one is for trying changes and for local
-# clients such as Claude Code. Secrets: .env (API_ID, API_HASH, AUTH_TOKEN) and ./data/session.txt from login.py.
+# The Telegram MCP server on your own machine or server: http://127.0.0.1:8790/<AUTH_TOKEN>/mcp, or /mcp with a
+# bearer header. Loopback only: for claude.ai, put HTTPS in front (a reverse proxy or a tunnel) and set ALLOWED_HOSTS
+# to the public name (README, Deploy, option C). Secrets: .env (API_ID, API_HASH, AUTH_TOKEN) and ./data/session.txt
+# from login.py, or TELEGRAM_SESSION in .env.
 name: telegram-mcp
 
 services:
