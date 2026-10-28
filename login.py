@@ -2,6 +2,7 @@
 
     python login.py                          API_ID and API_HASH from the environment, or asked for
     python login.py --out data/session.txt   the default, or TELEGRAM_SESSION_FILE
+    python login.py --country-code 44        for a phone number typed without +44 (the default is 1: US, Canada)
     docker compose run --rm telegram-mcp python login.py      the same, inside the container, into ./data
 
 It asks for your phone number, the code Telegram sends to your app, and your two-step verification password if you
@@ -13,18 +14,37 @@ import argparse
 import asyncio
 import getpass
 import os
+import re
 import sys
 
-from telethon import TelegramClient, utils
+from telethon import TelegramClient, errors, utils
 from telethon.sessions import StringSession
 
 DEVICE = {"device_model": "telegram-mcp", "system_version": "Claude connector", "app_version": "1.0"}   # server.py's
 
 
+def international(raw: str, country_code: str) -> str:
+    """A phone number as Telegram wants it, +<country code><number>. Without a + or 00 the country code is assumed,
+    and a national number's leading 0 is dropped: 07700 900123 with country code 44 is +447700900123."""
+    s = raw.strip()
+    digits = re.sub(r"\D", "", s)
+    if s.startswith("+"):
+        return "+" + digits
+    if digits.startswith("00"):
+        return "+" + digits[2:]
+    if digits.startswith(country_code) and len(digits) == len(country_code) + 10:
+        return "+" + digits     # 1 555 123 4567: the country code is already there
+    return "+" + country_code + digits.lstrip("0")
+
+
 async def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--out", default=os.environ.get("TELEGRAM_SESSION_FILE", "data/session.txt"))
+    ap.add_argument("--country-code", default="1", help="assumed when the phone number has no + (default 1)")
     args = ap.parse_args()
+    cc = args.country_code.lstrip("+")
+    if not re.fullmatch(r"[1-9]\d{0,2}", cc):
+        sys.exit("--country-code: 1 to 3 digits, such as 1 or 44")
     if os.path.exists(args.out):
         sys.exit(f"{args.out} already exists, and may be a live session: move it away (or end that session in "
                  "Telegram's Settings > Devices) first")
@@ -32,9 +52,19 @@ async def main() -> None:
     api_id = os.environ.get("API_ID") or input("API ID (my.telegram.org > API development tools): ").strip()
     api_hash = os.environ.get("API_HASH") or getpass.getpass("API hash (hidden): ").strip()
     client = TelegramClient(StringSession(), int(api_id), api_hash, receive_updates=False, **DEVICE)
-    await client.start(phone=lambda: input("Phone number, with country code (+1...): ").strip(),
-                       code_callback=lambda: input("The login code Telegram sent to your app: ").strip(),
-                       password=lambda: getpass.getpass("Two-step verification password (hidden): "))
+    while True:
+        phone = international(input(f"Phone number (+{cc} unless you type another +country code): "), cc)
+        if len(phone) < 8:
+            continue
+        print(f"Asking Telegram to send a login code for {phone}.")
+        try:
+            await client.start(phone=phone,
+                               code_callback=lambda: input("The login code Telegram sent to your app: ").strip(),
+                               password=lambda: getpass.getpass("Two-step verification password (hidden): "))
+            break
+        except errors.PhoneNumberInvalidError:   # nothing was sent, so asking again is safe
+            print(f"Telegram says {phone} isn't a valid number. Type it again, starting with + and the country code "
+                  f"if it isn't +{cc}.")
     me = await client.get_me()
     session = client.session.save()
     await client.disconnect()

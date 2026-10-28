@@ -228,6 +228,45 @@ class Crypto(unittest.TestCase):
         self.assertIsNone(s.open("refresh", payload[:-2] + "AA." + mac))
 
 
+class Login(unittest.IsolatedAsyncioTestCase):
+    def test_phone_numbers_get_a_country_code(self):
+        import login
+        for raw, cc, want in (("(555) 123-4567", "1", "+15551234567"), ("1 555 123 4567", "1", "+15551234567"),
+                              ("+44 7700 900123", "1", "+447700900123"), ("0044 7700 900123", "1", "+447700900123"),
+                              ("07700 900123", "44", "+447700900123")):
+            self.assertEqual(login.international(raw, cc), want, raw)
+
+    async def test_an_invalid_number_is_asked_again(self):
+        import login
+        from telethon import errors
+        clients = []
+
+        class Client:
+            session = SimpleNamespace(save=lambda: "1" * 353)
+
+            def __init__(self, *a, **kw):
+                self.phones = []
+                clients.append(self)
+
+            async def start(self, phone, code_callback, password):
+                self.phones.append(phone)
+                if len(self.phones) == 1:
+                    raise errors.PhoneNumberInvalidError(request=None)
+
+            async def get_me(self):
+                return user(ME, "Me")
+
+            async def disconnect(self):
+                pass
+        out = Path(tempfile.mkdtemp()) / "session.txt"
+        answers = iter(["555 0100", "(555) 123-4567"])
+        with mock.patch.object(login, "TelegramClient", Client), mock.patch("builtins.input", lambda _: next(answers)), \
+                mock.patch.object(sys, "argv", ["login.py", "--out", str(out)]), mock.patch("builtins.print"):
+            await login.main()
+        self.assertEqual(clients[0].phones, ["+15550100", "+15551234567"])
+        self.assertEqual(out.read_text(), "1" * 353 + "\n")
+
+
 class Http:
     """Requests through the Lambda handler, as a Function URL makes them."""
 

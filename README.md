@@ -48,7 +48,7 @@ python -m venv .venv
 .venv/bin/python login.py
 ```
 
-It asks for your phone number, the code Telegram sends to your app, and your two-step verification password if you have one. Then it writes the session to `data/session.txt` without showing it. Or skip the venv: `docker compose run --rm telegram-mcp python login.py` writes the same file through the image.
+It asks for your phone number, the code Telegram sends to your app, and your two-step verification password if you have one. A number typed without `+` is taken as `+1` (US and Canada): elsewhere, type the `+` and your country code, or pass `--country-code 44`, say. Then it writes the session to `data/session.txt` without showing it. Or skip the venv: `docker compose run --rm telegram-mcp python login.py` writes the same file through the image.
 
 That session can do anything your account can. It shows in Telegram under **Settings > Devices** as *telegram-mcp*, which is where you end it.
 
