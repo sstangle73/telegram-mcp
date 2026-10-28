@@ -1,0 +1,13 @@
+# Secrets: the Telegram session can do anything the account can.
+.env
+data/
+*.session
+*.session-journal
+session.txt
+connector-url.txt
+
+# Build output and local tooling
+build/
+.venv/
+__pycache__/
+*.pyc
