@@ -3,10 +3,16 @@
 It talks to Telegram as your own account (Telethon, the client API, not a bot), from the session string login.py
 makes. Anything that runs a container or `python server.py` (uvicorn) can host it, behind HTTPS. On AWS Lambda,
 lambda_handler.py is the entry point and deploy.py does the rest. Secrets come from the environment (API_ID,
-API_HASH, AUTH_TOKEN, and TELEGRAM_SESSION or TELEGRAM_SESSION_FILE), or from SSM when SSM_PREFIX is set.
+API_HASH, TELEGRAM_SESSION or TELEGRAM_SESSION_FILE, and those of the two ways in below), or from SSM when SSM_PREFIX
+is set.
 
-Auth: the token is either the first path segment, https://<host>/<token>/mcp (all a claude.ai custom connector can
-send), or a bearer header on /mcp. Anything else gets 404.
+Two ways in, either or both:
+  - Sign-in (oauth.py), when SIGNING_KEY, LOGIN_PASSWORD_HASH, TOTP_SECRET and PUBLIC_URL are set: the connector URL
+    is https://<host>/mcp, and Claude gets short-lived tokens after you sign in with a password and an
+    authenticator code. A leaked URL is useless.
+  - A static token, when AUTH_TOKEN is set: as the first path segment, https://<host>/<token>/mcp, or as a bearer
+    header on /mcp. Whoever has that URL is in, for as long as the token lasts.
+Without sign-in, anything but the token gets 404.
 
 Guards against instructions hidden in chat text (prompt injection):
   - Telegram's service chat (777000, where login codes arrive) and every chat in BLOCKED_CHATS is never listed, read,
@@ -31,7 +37,10 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Annotated, Any
 
+from urllib.parse import urlsplit
+
 from mcp.server import MCPServer
+from mcp.server.auth.provider import ProviderTokenVerifier
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
@@ -40,6 +49,8 @@ from starlette.datastructures import Headers
 from starlette.responses import PlainTextResponse
 from telethon import TelegramClient, utils
 from telethon.sessions import StringSession
+
+import oauth
 
 SERVICE_CHAT = 777000           # "Telegram": login codes and security notices
 AUDIT_TAG = "#claude_sent"
@@ -55,11 +66,16 @@ class Config:
     api_id: int
     api_hash: str
     session: str
-    auth_token: str
+    auth_token: str | None
+    signin: oauth.Settings | None
     blocked: frozenset[int]
     send_limit: int
     allowed_hosts: list[str]
     allowed_origins: list[str]
+
+
+REQUIRED = ("api-id", "api-hash", "session")
+OPTIONAL = ("auth-token", "signing-key", "login-password-hash", "totp-secret")
 
 
 def _csv(name: str, default: str = "") -> list[str]:
@@ -69,13 +85,13 @@ def _csv(name: str, default: str = "") -> list[str]:
 def _from_ssm(prefix: str) -> dict[str, str]:
     """The secrets deploy.py stored in SSM Parameter Store. boto3 comes with Lambda's Python runtime."""
     import boto3
-    names = {k: f"{prefix}/{k}" for k in ("api-id", "api-hash", "session", "auth-token")}
+    names = {k: f"{prefix}/{k}" for k in REQUIRED + OPTIONAL}
     got = {p["Name"]: p["Value"] for p in
            boto3.client("ssm").get_parameters(Names=list(names.values()), WithDecryption=True)["Parameters"]}
-    missing = [n for n in names.values() if n not in got]
+    missing = [names[k] for k in REQUIRED if names[k] not in got]
     if missing:
         raise SystemExit(f"missing SSM parameters {', '.join(missing)}: run deploy.py --apply")
-    return {k: got[n] for k, n in names.items()}
+    return {k: got.get(n, "") for k, n in names.items()}
 
 
 def _from_env() -> dict[str, str]:
@@ -89,7 +105,7 @@ def _from_env() -> dict[str, str]:
         except FileNotFoundError:
             raise SystemExit(f"no Telegram session: set TELEGRAM_SESSION, or run login.py to make {path}") from None
     return {"api-id": os.environ.get("API_ID", ""), "api-hash": os.environ.get("API_HASH", ""), "session": session,
-            "auth-token": os.environ.get("AUTH_TOKEN", "")}
+            **{k: os.environ.get(k.upper().replace("-", "_"), "") for k in OPTIONAL}}
 
 
 @functools.cache
@@ -98,15 +114,20 @@ def config() -> Config:
     s = _from_ssm(prefix) if prefix else _from_env()
     if not s["api-id"].strip().isdigit() or not s["api-hash"].strip():
         raise SystemExit("API_ID and API_HASH are required (my.telegram.org, API development tools)")
-    token = s["auth-token"].strip()
-    if len(token) < 32 or not re.fullmatch(r"[A-Za-z0-9_-]+", token):
+    token = s["auth-token"].strip() or None
+    if token and (len(token) < 32 or not re.fullmatch(r"[A-Za-z0-9_-]+", token)):
         raise SystemExit("AUTH_TOKEN must be 32+ characters of letters, digits, - and _ (it goes in a URL): "
                          "python -c \"import secrets; print(secrets.token_urlsafe(32))\"")
+    signin = oauth.settings(s)
+    if not token and not signin:
+        raise SystemExit("no way in: set up sign-in (setup_signin.py, README step 3) or set AUTH_TOKEN")
+    # Behind sign-in, the public name is known; Host headers outside the list get 421 (DNS-rebinding protection).
+    hosts = urlsplit(signin.issuer).netloc if signin else "127.0.0.1:*,localhost:*"
     return Config(
         api_id=int(s["api-id"]), api_hash=s["api-hash"].strip(), session=s["session"].strip(), auth_token=token,
-        blocked=frozenset({SERVICE_CHAT, *(int(x) for x in _csv("BLOCKED_CHATS"))}),
+        signin=signin, blocked=frozenset({SERVICE_CHAT, *(int(x) for x in _csv("BLOCKED_CHATS"))}),
         send_limit=int(os.environ.get("SEND_LIMIT_PER_HOUR", "20")),
-        allowed_hosts=_csv("ALLOWED_HOSTS", "127.0.0.1:*,localhost:*"),
+        allowed_hosts=_csv("ALLOWED_HOSTS", hosts),
         allowed_origins=_csv("ALLOWED_ORIGINS", "https://claude.ai,https://claude.com"))
 
 
@@ -349,11 +370,14 @@ async def send_message(
 
 
 class TokenGate:
-    """Passes a request on only with the token: as the first path segment (/<token>/mcp), or as `Authorization:
-    Bearer <token>` on /mcp. /healthz answers anyone; everything else is 404, so a scan learns nothing."""
+    """/healthz answers anyone. With AUTH_TOKEN, /<token>/mcp is let in. Then:
+      - with sign-in, everything else goes to the SDK, which answers /mcp without a valid token with a 401 that says
+        where to sign in, and serves the OAuth routes; the static token reaches it as a bearer header;
+      - without sign-in, only `Authorization: Bearer <token>` on /mcp is let in, and the rest is 404, so a scan
+        learns nothing."""
 
-    def __init__(self, app, token: str):
-        self.app, self.token = app, token.encode()
+    def __init__(self, app, token: str | None, signin: bool):
+        self.app, self.token, self.signin = app, token.encode() if token else None, signin
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
@@ -362,12 +386,19 @@ class TokenGate:
         if path == "/healthz":
             return await PlainTextResponse("ok")(scope, receive, send)
         head, _, rest = path.lstrip("/").partition("/")
-        if rest and hmac.compare_digest(head.encode(), self.token):
+        if self.token and rest and hmac.compare_digest(head.encode(), self.token):
             scope = dict(scope, path="/" + rest, raw_path=("/" + rest).encode())
+            if self.signin:
+                if scope["path"] != "/mcp":
+                    return await PlainTextResponse("Not found", status_code=404)(scope, receive, send)
+                scope["headers"] = [(k, v) for k, v in scope["headers"] if k.lower() != b"authorization"]
+                scope["headers"].append((b"authorization", b"Bearer " + self.token))
+            return await self.app(scope, receive, send)
+        if self.signin:
             return await self.app(scope, receive, send)
         auth = Headers(scope=scope).get("authorization", "")
-        if path == "/mcp" and auth[:7].lower() == "bearer " and hmac.compare_digest(auth[7:].strip().encode(),
-                                                                                    self.token):
+        if (self.token and path == "/mcp" and auth[:7].lower() == "bearer "
+                and hmac.compare_digest(auth[7:].strip().encode(), self.token)):
             return await self.app(scope, receive, send)
         await PlainTextResponse("Not found", status_code=404)(scope, receive, send)
 
@@ -375,15 +406,22 @@ class TokenGate:
 def create_app():
     """The ASGI app: stateless JSON over streamable HTTP, since each Lambda call may land in a fresh container."""
     cfg = config()
-    app = mcp.streamable_http_app(
-        streamable_http_path="/mcp", stateless_http=True, json_response=True,
-        transport_security=TransportSecuritySettings(allowed_hosts=cfg.allowed_hosts,
-                                                     allowed_origins=cfg.allowed_origins))
-    return TokenGate(app, cfg.auth_token)
+    http = {"streamable_http_path": "/mcp", "stateless_http": True, "json_response": True,
+            "transport_security": TransportSecuritySettings(allowed_hosts=cfg.allowed_hosts,
+                                                            allowed_origins=cfg.allowed_origins)}
+    if not cfg.signin:
+        return TokenGate(mcp.streamable_http_app(**http), cfg.auth_token, signin=False)
+    provider = oauth.Provider(cfg.signin, cfg.auth_token)
+    # MCPServer takes its auth when it's built, before config is read; the lowlevel server takes it here.
+    app = mcp._lowlevel_server.streamable_http_app(
+        **http, auth=provider.auth_settings(), token_verifier=ProviderTokenVerifier(provider),
+        auth_server_provider=provider, custom_starlette_routes=provider.routes())
+    provider.install(app)
+    return TokenGate(app, cfg.auth_token, signin=True)
 
 
 if __name__ == "__main__":
     import uvicorn
-    # No access log: claude.ai's URL carries the token.
+    # No access log: a token URL carries the token.
     uvicorn.run(create_app(), host=os.environ.get("HOST", "127.0.0.1"), port=int(os.environ.get("PORT", "8000")),
                 access_log=False)

@@ -16,6 +16,8 @@
      "Resource": "arn:aws:ssm:*:*:parameter/telegram-mcp/*"},
     {"Sid": "ReadOnlyTheTokenForTheUrl", "Effect": "Allow", "Action": "ssm:GetParameter",
      "Resource": "arn:aws:ssm:*:*:parameter/telegram-mcp/auth-token"},
+    {"Sid": "TurnTheTokenOff", "Effect": "Allow", "Action": "ssm:DeleteParameter",
+     "Resource": "arn:aws:ssm:*:*:parameter/telegram-mcp/auth-token"},
     {"Sid": "ListParameterNames", "Effect": "Allow", "Action": "ssm:DescribeParameters", "Resource": "*"},
     {"Sid": "SecureStringsThroughSsm", "Effect": "Allow", "Action": ["kms:Encrypt", "kms:Decrypt", "kms:GenerateDataKey"],
      "Resource": "*", "Condition": {"StringLike": {"kms:ViaService": "ssm.*.amazonaws.com"}}},

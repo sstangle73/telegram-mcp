@@ -5,6 +5,7 @@ data/
 *.session-journal
 session.txt
 connector-url.txt
+signin.env
 
 # Build output and local tooling
 build/

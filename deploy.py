@@ -1,24 +1,36 @@
 """Deploy the Telegram MCP server to AWS Lambda behind a Function URL. A dry run unless --apply.
 
     python deploy.py                              what exists, and what --apply would change (builds the zip locally)
-    python deploy.py --apply --session-file data/session.txt
-                                                  the first deploy: store login.py's session, then create everything
+    python deploy.py --apply --session-file data/session.txt --signin-file data/signin.env
+                                                  the first deploy: store login.py's session and setup_signin.py's
+                                                  sign-in, then create everything
     python deploy.py --apply                      after a code change: update what differs
-    python deploy.py --apply --rotate-token       a new connector URL; the old one stops working
-    python deploy.py --url                        put the connector URL on the clipboard (or in data/connector-url.txt)
+    python deploy.py --url                        print the connector URL, and put it on the clipboard
     python deploy.py --apply --only-role          just the IAM role, for someone allowed to manage IAM (see below)
+
+Sign-in (a password and an authenticator code, through OAuth) is the way in to prefer: its connector URL holds no
+secret. A static token is the other way: its URL, https://<host>/<token>/mcp, is the secret. A first deploy without
+--signin-file makes a token; with it, none. Later:
+    --signin-file F        set up sign-in, or replace its password and secret (which signs every client out)
+    --rotate-signing-key   sign every client out, keeping the password
+    --rotate-token         a new token URL, the old one stops working (and makes a token if there's none)
+    --no-token             turn the token off, leaving sign-in only
+    --url token            the token URL instead: it goes on the clipboard (or in data/connector-url.txt), never
+                           the screen
 
 It uses boto3's usual credentials (AWS_PROFILE, AWS_ACCESS_KEY_ID and friends, SSO) or --profile, in --region (else
 your AWS config's region, else us-east-1). Everything is named after --name (default telegram-mcp), so one account
 can hold several copies, one per Telegram account.
 
 What it manages:
-  - SSM Parameter Store /<name>/: api-id (String), and api-hash, session and auth-token (SecureString). The session
-    can do anything your Telegram account can. Nothing here prints it or the token.
-  - IAM role <name>-lambda: its logs, and reading those four parameters. Deploying with credentials that can't manage
+  - SSM Parameter Store /<name>/: api-id (String); api-hash and session (SecureString); for sign-in,
+    login-password-hash, totp-secret and signing-key; for the token, auth-token (SecureString). The session can do
+    anything your Telegram account can. Nothing here prints it, the token or the sign-in secrets.
+  - IAM role <name>-lambda: its logs, and reading its own parameters. Deploying with credentials that can't manage
     IAM (aws/deploy-policy.json is such a policy)? Have someone who can run --only-role once.
   - Lambda function <name> (python3.14, arm64, 512 MB, 60 s), reserved concurrency 2, logs kept 30 days.
-  - Its Function URL (auth NONE: the server checks the token itself) and the two public permissions a URL needs.
+  - Its Function URL (auth NONE: the server checks sign-in and the token itself), the two public permissions a URL
+    needs, and the PUBLIC_URL and ALLOWED_HOSTS that match it.
 Whoever can replace the function's code can reach the session through it, so treat deploy credentials accordingly.
 """
 import argparse
@@ -50,6 +62,7 @@ FUNCTION = {"Runtime": RUNTIME, "Handler": "lambda_handler.handler", "MemorySize
 TAGS = {"managed-by": "telegram-mcp deploy.py"}
 TRUST = {"Version": "2012-10-17", "Statement": [
     {"Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"}]}
+SIGNIN = {"LOGIN_PASSWORD_HASH": "login-password-hash", "TOTP_SECRET": "totp-secret", "SIGNING_KEY": "signing-key"}
 
 
 def role_policy(account, region, name):
@@ -77,6 +90,21 @@ def dotenv():
     return vals
 
 
+def read_signin(path):
+    """setup_signin.py's three secrets, by their SSM names."""
+    vals = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        k, sep, v = line.strip().partition("=")
+        if sep and k in SIGNIN and v.strip():
+            vals[SIGNIN[k]] = v.strip()
+    missing = [k for k, n in SIGNIN.items() if n not in vals]
+    if missing:
+        sys.exit(f"{path} has no {', '.join(missing)}: setup_signin.py writes all three")
+    if not vals["login-password-hash"].startswith("scrypt:") or len(vals["signing-key"]) < 32:
+        sys.exit(f"{path} doesn't look like setup_signin.py's: run it again")
+    return vals
+
+
 def build_zip():
     out = ROOT / "build" / "lambda"
     shutil.rmtree(out, ignore_errors=True)
@@ -87,7 +115,7 @@ def build_zip():
                     "--no-compile", "--only-binary=:all:", "--no-binary=" + ",".join(SDIST_ONLY), *tags,
                     "--implementation", "cp", "--python-version", PYTHON, "--target", str(out),
                     "-r", str(ROOT / "requirements.txt")], check=True)
-    for f in ("server.py", "lambda_handler.py"):
+    for f in ("server.py", "oauth.py", "lambda_handler.py"):
         shutil.copy2(ROOT / f, out / f)
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
@@ -155,8 +183,12 @@ def main():
     ap = argparse.ArgumentParser(description="Deploy the Telegram MCP server to AWS Lambda (dry run by default).")
     ap.add_argument("--apply", action="store_true", help="make the changes")
     ap.add_argument("--session-file", type=Path, help="store this Telegram session (from login.py)")
-    ap.add_argument("--rotate-token", action="store_true", help="new auth token, so a new connector URL")
-    ap.add_argument("--url", action="store_true", help="only put the connector URL on the clipboard")
+    ap.add_argument("--signin-file", type=Path, help="set up sign-in from this file (from setup_signin.py)")
+    ap.add_argument("--rotate-signing-key", action="store_true", help="sign every client out")
+    ap.add_argument("--rotate-token", action="store_true", help="new auth token, so a new token URL")
+    ap.add_argument("--no-token", action="store_true", help="turn the token off: sign-in only")
+    ap.add_argument("--url", nargs="?", const="auto", choices=["auto", "signin", "token"],
+                    help="only show the connector URL: sign-in's if it's set up, else the token's")
     ap.add_argument("--only-role", action="store_true", help="only create or update the IAM role")
     ap.add_argument("--send-limit", type=int, help="SEND_LIMIT_PER_HOUR (default: keep, or 20)")
     ap.add_argument("--blocked-chats", help="BLOCKED_CHATS, comma-separated chat ids (default: keep)")
@@ -199,9 +231,25 @@ def main():
             if code(e) != "ResourceNotFoundException":
                 raise
 
+    have = {p["Name"].rsplit("/", 1)[1] for page in ssm.get_paginator("describe_parameters").paginate(
+        ParameterFilters=[{"Key": "Name", "Option": "BeginsWith", "Values": [prefix + "/"]}])
+        for p in page["Parameters"]}
+    signin_was = set(SIGNIN.values()) <= have
+
     if args.url:
         if not furl:
             sys.exit("no Function URL yet: run deploy.py --apply first")
+        if args.url == "signin" or (args.url == "auto" and signin_was):
+            if not signin_was:
+                sys.exit("sign-in isn't set up: run setup_signin.py, then deploy.py --apply --signin-file "
+                         "data/signin.env")
+            url = f"{furl.rstrip('/')}/mcp"
+            on_clipboard = to_clipboard(url)
+            print(f"connector URL: {url}{' (on the clipboard too)' if on_clipboard else ''}. It holds no secret: "
+                  "Claude asks you to sign in with your password and authenticator code.")
+            return
+        if "auth-token" not in have:
+            sys.exit("this deployment has no token, only sign-in: python deploy.py --url")
         token = ssm.get_parameter(Name=f"{prefix}/auth-token", WithDecryption=True)["Parameter"]["Value"]
         url = f"{furl.rstrip('/')}/{token}/mcp"
         if to_clipboard(url):
@@ -220,11 +268,8 @@ def main():
         sys.exit(denied)
 
     # 2. The parameters.
-    have = {p["Name"].rsplit("/", 1)[1] for page in ssm.get_paginator("describe_parameters").paginate(
-        ParameterFilters=[{"Key": "Name", "Option": "BeginsWith", "Values": [prefix + "/"]}])
-        for p in page["Parameters"]}
     changed_secrets = False
-    puts = []
+    puts, deletes = [], []
     env = dotenv()
     for key, kind, var in (("api-id", "String", "API_ID"), ("api-hash", "SecureString", "API_HASH")):
         if key not in have:
@@ -239,23 +284,45 @@ def main():
         puts.append(("session", "SecureString", value))
     elif "session" not in have:
         sys.exit("no Telegram session in SSM yet: run login.py, then pass --session-file data/session.txt")
-    if args.rotate_token or "auth-token" not in have:
+    signin = bool(args.signin_file) or signin_was
+    if args.signin_file:
+        puts += [(key, "SecureString", value) for key, value in read_signin(args.signin_file).items()]
+    elif args.rotate_signing_key:
+        if not signin:
+            sys.exit("--rotate-signing-key: sign-in isn't set up (--signin-file)")
+        puts.append(("signing-key", "SecureString", secrets.token_urlsafe(32)))
+    if args.no_token:
+        if args.rotate_token:
+            sys.exit("--no-token and --rotate-token: pick one")
+        if not signin:
+            sys.exit("--no-token would leave no way in: set up sign-in first (setup_signin.py, --signin-file)")
+        if "auth-token" in have:
+            deletes.append("auth-token")
+    elif args.rotate_token or ("auth-token" not in have and not signin):
         puts.append(("auth-token", "SecureString", secrets.token_urlsafe(32)))
     for key, kind, value in puts:
         print(f"{do}put SSM {prefix}/{key} ({kind}{', new' if key not in have else ', replacing'})")
         if apply:
             ssm.put_parameter(Name=f"{prefix}/{key}", Type=kind, Value=value, Overwrite=key in have, Tier="Standard")
         changed_secrets = True
-    if not puts:
-        print(f"SSM {prefix}/: api-id, api-hash, session and auth-token in place")
-    elif args.session_file and apply:
-        print(f"the session is in SSM now: delete {args.session_file} unless you also run the server locally")
+    for key in deletes:
+        print(f"{do}delete SSM {prefix}/{key} (the token URL stops working)")
+        if apply:
+            ssm.delete_parameter(Name=f"{prefix}/{key}")
+        changed_secrets = True
+    if not puts and not deletes:
+        print(f"SSM {prefix}/: {', '.join(sorted(have))} in place")
+    if apply:
+        for path in (args.session_file, args.signin_file):
+            if path:
+                print(f"{path} is in SSM now: delete it unless you also run the server locally")
 
     # 3. The code and the function.
     zip_bytes, sha = build_zip()
     print(f"built the zip: {len(zip_bytes) // 1024} KiB, sha256 {sha[:12]}...")
     current = (function or {}).get("Environment", {}).get("Variables", {})
     variables = {"SSM_PREFIX": prefix,
+                 "PUBLIC_URL": furl.rstrip("/") if furl else "",
                  "ALLOWED_HOSTS": furl.split("/")[2] if furl else "",
                  "SEND_LIMIT_PER_HOUR": str(args.send_limit or current.get("SEND_LIMIT_PER_HOUR", "20")),
                  "BLOCKED_CHATS": args.blocked_chats if args.blocked_chats is not None else current.get(
@@ -300,7 +367,7 @@ def main():
         if apply:
             furl = lam.create_function_url_config(FunctionName=name, AuthType="NONE", InvokeMode="BUFFERED")[
                 "FunctionUrl"]
-            variables["ALLOWED_HOSTS"] = furl.split("/")[2]
+            variables["PUBLIC_URL"], variables["ALLOWED_HOSTS"] = furl.rstrip("/"), furl.split("/")[2]
             lam.update_function_configuration(FunctionName=name, Environment={"Variables": variables})
             wait(lam, name, "function_updated_v2")
     try:
@@ -342,6 +409,8 @@ def main():
 
     if not apply:
         print("dry run: nothing changed. Run again with --apply.")
+    elif furl and signin:
+        print(f"done: the connector URL is {furl.rstrip('/')}/mcp, and Claude asks you to sign in.")
     elif furl:
         print(f"done: {furl}<token>/mcp. python deploy.py --url puts the full connector URL on the clipboard.")
 

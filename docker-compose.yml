@@ -1,7 +1,6 @@
-# The Telegram MCP server on your own machine or server: http://127.0.0.1:8790/<AUTH_TOKEN>/mcp, or /mcp with a
-# bearer header. Loopback only: for claude.ai, put HTTPS in front (a reverse proxy or a tunnel) and set ALLOWED_HOSTS
-# to the public name (README, Deploy, option C). Secrets: .env (API_ID, API_HASH, AUTH_TOKEN) and ./data/session.txt
-# from login.py, or TELEGRAM_SESSION in .env.
+# The Telegram MCP server on your own machine or server, on 127.0.0.1:8790 only: for claude.ai, put HTTPS in front
+# (a reverse proxy or a tunnel) and set PUBLIC_URL to that address (README, Deploy, option C). Secrets: .env (API_ID,
+# API_HASH, and sign-in's or AUTH_TOKEN) and ./data/session.txt from login.py, or TELEGRAM_SESSION in .env.
 name: telegram-mcp
 
 services:
@@ -10,7 +9,10 @@ services:
     image: telegram-mcp:local
     container_name: telegram-mcp
     restart: unless-stopped
-    env_file: [.env]
+    env_file:
+      - .env
+      - path: data/signin.env   # setup_signin.py's sign-in secrets, once you've made them
+        required: false
     volumes:
       - ./data:/data
     ports:
