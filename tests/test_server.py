@@ -267,6 +267,43 @@ class Login(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(out.read_text(), "1" * 353 + "\n")
 
 
+class SetupSignin(unittest.TestCase):
+    """setup_signin.py --password-stdin, as a password manager's script drives it."""
+
+    def run_it(self, stdin: bytes, out: Path):
+        import io
+        import setup_signin
+        printed = io.StringIO()
+        with mock.patch.object(sys, "stdin", io.TextIOWrapper(io.BytesIO(stdin))), \
+                mock.patch.object(sys, "argv", ["setup_signin.py", "--out", str(out), "--password-stdin"]), \
+                mock.patch("sys.stdout", printed), mock.patch("builtins.input", side_effect=AssertionError("asked")):
+            setup_signin.main()
+        return printed.getvalue()
+
+    def test_a_piped_password_makes_a_working_file_and_shows_nothing_secret(self):
+        out = Path(tempfile.mkdtemp()) / "signin.env"
+        printed = self.run_it(b"\xef\xbb\xbf" + PASSWORD.encode() + b"\r\nignored second line\r\n", out)
+        vals = dict(line.split("=", 1) for line in out.read_text().splitlines() if not line.startswith("#"))
+        self.assertEqual(set(vals), {"LOGIN_PASSWORD_HASH", "TOTP_SECRET", "SIGNING_KEY"})
+        self.assertTrue(oauth.check_password(PASSWORD, vals["LOGIN_PASSWORD_HASH"]))   # BOM and CR LF dropped
+        step = int(time.time() // 30)
+        self.assertEqual(oauth.check_totp(vals["TOTP_SECRET"], oauth.totp(vals["TOTP_SECRET"], step)), step)
+        for secret in (PASSWORD, *vals.values()):
+            self.assertNotIn(secret, printed)
+        self.assertEqual(printed.count("\n"), 1)
+        with environment(AUTH_TOKEN=None, PUBLIC_URL=PUBLIC, **vals):   # the server takes it as it is
+            self.assertIsNotNone(server.config().signin)
+        with self.assertRaises(SystemExit):   # and it never overwrites one
+            self.run_it(PASSWORD.encode() + b"\n", out)
+
+    def test_a_short_or_missing_password_is_refused(self):
+        for stdin in (b"short\r\n", b""):
+            out = Path(tempfile.mkdtemp()) / "signin.env"
+            with self.subTest(stdin=stdin), self.assertRaises(SystemExit):
+                self.run_it(stdin, out)
+            self.assertFalse(out.exists())
+
+
 class Http:
     """Requests through the Lambda handler, as a Function URL makes them."""
 

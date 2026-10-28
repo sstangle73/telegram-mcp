@@ -60,6 +60,8 @@ That session can do anything your account can. It shows in Telegram under **Sett
 
 It asks for a new password (12 characters or more; one from a password manager is best). Once you say so, it shows a setup key for your authenticator app (Bitwarden, 1Password, Aegis, Google Authenticator and the like), then checks a code from the app. It writes `LOGIN_PASSWORD_HASH`, `TOTP_SECRET` and `SIGNING_KEY` to `data/signin.env`, readable only by you. Running it again replaces all three, which signs every client out. Or `docker compose run --rm telegram-mcp python setup_signin.py` does the same through the image.
 
+To script it from a password manager, pipe the password in: `setup_signin.py --password-stdin` reads the first line of stdin, asks nothing and prints nothing secret. Your script then adds the file's `TOTP_SECRET` to the authenticator (SHA-1, 6 digits, 30 seconds).
+
 Skip this step if you want only a static token.
 
 ## 4. Deploy: pick one
