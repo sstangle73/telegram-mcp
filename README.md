@@ -264,7 +264,7 @@ The `resource` must be exactly the URL you add in Claude: `PUBLIC_URL` plus `/mc
 .venv/bin/python -m unittest discover -s tests
 ```
 
-The tests run the guards against a fake Telegram. They also run the token gate, the whole sign-in (discovery, both client types, the page, codes, tokens and refresh), `login.py` and `setup_signin.py`, and the MCP SDK through the Lambda handler. `requirements.txt` pins every package, and both the image and the Lambda zip are built from it. Issues and merge requests on GitLab are welcome; for anything security-related, see below first.
+The tests run the guards against a fake Telegram. They also run the token gate, the whole sign-in (discovery, both client types, the page, codes, tokens and refresh), `login.py` and `setup_signin.py`, the MCP SDK through the Lambda handler, and `deploy.py` against a fake AWS. Tests marked `expectedFailure` are known bugs, each with a comment saying what's wrong. `requirements.txt` pins every package, and both the image and the Lambda zip are built from it. Issues and merge requests on GitLab are welcome; for anything security-related, see below first.
 
 | File | What it is |
 |---|---|
