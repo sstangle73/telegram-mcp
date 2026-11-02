@@ -1,14 +1,18 @@
 """The guards and the HTTP path, against a fake Telegram: python -m unittest discover -s tests"""
 import base64
+import dataclasses
 import datetime as dt
 import hashlib
+import http.server
 import json
 import os
 import secrets
 import sys
 import tempfile
+import threading
 import time
 import unittest
+import urllib.error
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -34,6 +38,7 @@ from mcp_types import LATEST_PROTOCOL_VERSION  # noqa: E402
 
 ME = 1000
 NOW = dt.datetime.now(dt.timezone.utc)
+REAL_OPEN_CLIENT = server.open_client   # the HTTP tests below replace it
 
 
 def user(uid, first):
@@ -166,6 +171,218 @@ class Tools(unittest.IsolatedAsyncioTestCase):
         found = (await server.search_messages("see you"))["messages"]
         self.assertEqual((found[0]["chat"]["name"], found[0]["text"]), ("Alice", "see you at 6"))
 
+    async def test_a_refused_send_never_reaches_telegram(self):
+        self.tg.get_entity = mock.AsyncMock(return_value=user(777000, "Telegram"))
+        for chat in ("777000", "-1009999", "Telegram", "Bank alerts", "@service_chat", "nobody", "12345"):
+            with self.subTest(chat=chat), self.assertRaises(ToolError):
+                await server.send_message(chat, "x")
+        self.assertEqual(self.tg.sent, [])
+
+    async def test_a_blocked_chat_cant_be_reached_by_username(self):
+        self.tg.get_entity = mock.AsyncMock(return_value=user(777000, "Telegram"))
+        with self.assertRaises(ToolError):
+            await server.read_messages("@service_chat")
+        with self.assertRaises(ToolError):
+            await server.search_messages("code", chat="@service_chat")
+
+    async def test_a_username_sends_to_that_person(self):
+        alice = types.User(id=42, first_name="Alice", access_hash=1)
+        self.tg.get_entity = mock.AsyncMock(return_value=alice)
+        self.tg._chat = lambda entity: ME if entity == "me" else entity.user_id
+        r = await server.send_message("@alice", "hello")
+        self.assertEqual(r["chat"], {"id": 42, "name": "Alice"})
+        self.assertEqual(self.tg.sent[0][0], 42)
+
+    async def test_an_id_works_after_a_cold_start(self):
+        self.assertEqual((await server.read_messages("42"))["chat"]["name"], "Alice")   # _known is empty
+
+    async def test_an_id_outside_your_dialogs_is_refused(self):
+        with self.assertRaises(ToolError) as cm:
+            await server.read_messages("5")
+        self.assertIn("take ids from list_dialogs", str(cm.exception))
+
+    async def test_a_unique_part_of_a_name_finds_the_chat(self):
+        self.assertEqual((await server.read_messages("  ali "))["chat"]["id"], 42)   # any case, spaces aside
+        with self.assertRaises(ToolError):
+            await server.read_messages("nobody")
+
+    # resolve() searches for the cleaned name, and "" is in every name, so with one chat left after the blocked ones
+    # a blank chat (or a name that was all hidden characters) goes to that chat. With more, "Several chats match".
+    @unittest.expectedFailure
+    async def test_a_blank_name_finds_nothing(self):
+        self.tg.dialogs = self.tg.dialogs[:1]
+        for chat in ("", "   ", "​"):
+            with self.subTest(chat=chat), self.assertRaises(ToolError):
+                await server.send_message(chat, "x")
+
+    async def test_listing_keeps_to_limit_and_unread(self):
+        self.assertEqual(len((await server.list_dialogs(limit=1))["dialogs"]), 1)
+        unread = (await server.list_dialogs(unread_only=True))["dialogs"]
+        self.assertEqual([(d["id"], d["unread"], d["type"]) for d in unread], [(42, 2, "user")])
+
+    async def test_kinds_of_chat(self):
+        d = SimpleNamespace(is_user=True, entity=SimpleNamespace(bot=True), is_group=False)
+        self.assertEqual(server._kind(d), "bot")
+        self.assertEqual(server._kind(SimpleNamespace(is_user=False, is_group=True)), "group")
+        self.assertEqual(server._kind(SimpleNamespace(is_user=False, is_group=False)), "channel")
+
+    async def test_messages_come_oldest_first_between_the_dates(self):
+        day = dt.datetime(2026, 1, 10, 12, tzinfo=dt.timezone.utc)
+        self.tg.chats[42] = [self.tg._msg(i, day + dt.timedelta(days=i), None, f"m{i}", 42) for i in range(5)]
+        r = await server.read_messages("42", after="2026-01-11T12:00:00Z", before="2026-01-14T12:00:00+00:00")
+        self.assertEqual([m["text"] for m in r["messages"]], ["m2", "m3"])   # both ends exclusive
+        r = await server.read_messages("42", limit=2)
+        self.assertEqual([m["text"] for m in r["messages"]], ["m3", "m4"])   # the newest two
+        r = await server.read_messages("42", after="2026-01-12")             # no zone is UTC
+        self.assertEqual([m["text"] for m in r["messages"]], ["m2", "m3", "m4"])
+
+    async def test_a_bad_date_is_refused(self):
+        for field in ("after", "before"):
+            with self.subTest(field=field), self.assertRaises(ToolError) as cm:
+                await server.read_messages("42", **{field: "last Tuesday"})
+            self.assertIn(field, str(cm.exception))
+
+    async def test_what_a_message_carries(self):
+        m = self.tg._msg(7, NOW, user(42, "Alice"), None, 42)
+        m.reply_to_msg_id, m.fwd_from = 3, object()
+        m.media = types.MessageMediaPhoto()
+        m.action = types.MessageActionPinMessage()
+        self.assertEqual(server._message(m), {"id": 7, "date": NOW.isoformat(), "from": "Alice", "text": "", "reply_to": 3,
+                                              "media": "Photo", "event": "PinMessage", "forwarded": True})
+        mine = self.tg._msg(8, NOW, user(ME, "Me"), "hello", 42, out=True)
+        self.assertEqual(server._message(mine)["from"], "me")
+
+    async def test_search_in_one_chat(self):
+        found = (await server.search_messages("code", chat="Alice"))["messages"]
+        self.assertEqual([m["chat"] for m in found], [{"id": 42, "name": "Alice"}])
+        self.assertEqual((await server.search_messages("no such words", chat="42"))["messages"], [])
+
+    async def test_a_full_page_of_search_results_isnt_cut_short_by_blocked_chats(self):
+        self.tg.chats[777000] = [self.tg._msg(i, NOW, None, "code", 777000) for i in range(20)]
+        self.tg.chats[42] = [self.tg._msg(i, NOW - dt.timedelta(hours=1), None, "code", 42) for i in range(5)]
+        found = (await server.search_messages("code", limit=2))["messages"]
+        self.assertEqual([m["chat"]["id"] for m in found], [42, 42])
+
+    # The over-fetch at server.py:365 is limit * 3 + 20 and it fetches once, so when that many of the newest matches
+    # are in blocked chats the search says there's nothing, with real matches further back. "code" and the service
+    # chat, which is all login codes, is the likely case.
+    @unittest.expectedFailure
+    async def test_a_busy_blocked_chat_doesnt_hide_older_matches(self):
+        self.tg.chats[777000] = [self.tg._msg(i, NOW, None, "code", 777000) for i in range(30)]
+        self.tg.chats[42] = [self.tg._msg(i, NOW - dt.timedelta(hours=1), None, "code", 42) for i in range(5)]
+        found = (await server.search_messages("code", limit=2))["messages"]
+        self.assertEqual([m["chat"]["id"] for m in found], [42, 42])
+
+    async def test_an_empty_message_is_refused(self):
+        with self.assertRaises(ToolError):
+            await server.send_message("42", " \n\t")
+        self.assertEqual(self.tg.sent, [])
+
+    async def test_a_reply_goes_to_the_message(self):
+        seen = {}
+        real = self.tg.send_message
+
+        async def spy(entity, text, reply_to=None, **kw):
+            seen.setdefault("reply_to", reply_to)
+            return await real(entity, text, reply_to=reply_to, **kw)
+        self.tg.send_message = spy
+        await server.send_message("42", "yes", reply_to=9)
+        self.assertEqual(seen["reply_to"], 9)
+
+    async def test_a_note_to_yourself_is_not_audited(self):
+        for chat in ("me", "Saved Messages", str(ME)):
+            self.tg.dialogs.append(SimpleNamespace(id=ME, name="Me", entity=None, input_entity="me", unread_count=0,
+                                                   date=NOW, archived=False, is_user=True, is_group=False, is_channel=False))
+            with self.subTest(chat=chat):
+                self.tg.sent.clear()
+                r = await server.send_message(chat, "note")
+                self.assertIsNone(r["audit"])
+                self.assertEqual(len(self.tg.sent), 1)
+
+    async def test_a_failed_audit_copy_says_so_and_the_message_stays_sent(self):
+        real = self.tg.send_message
+
+        async def fails_for_me(entity, text, **kw):
+            if entity == "me":
+                raise ConnectionError("flood")
+            return await real(entity, text, **kw)
+        self.tg.send_message = fails_for_me
+        r = await server.send_message("42", "hello")
+        self.assertTrue(r["sent"])
+        self.assertEqual(r["audit"], "NOT copied to Saved Messages (ConnectionError)")
+
+    # The hourly cap counts audit copies, so a send whose copy failed isn't counted: while Saved Messages refuses
+    # writes, send_message has no cap at all.
+    @unittest.expectedFailure
+    async def test_a_send_whose_audit_copy_failed_still_counts(self):
+        real = self.tg.send_message
+
+        async def fails_for_me(entity, text, **kw):
+            if entity == "me":
+                raise ConnectionError("flood")
+            return await real(entity, text, **kw)
+        self.tg.send_message = fails_for_me
+        for _ in range(3):
+            await server.send_message("42", "hello")
+        with self.assertRaises(ToolError):
+            await server.send_message("42", "one too many")
+
+    async def test_the_audit_copy_of_a_long_message_still_fits(self):
+        await server.send_message("42", "x" * 4096)
+        (_, text, _, _), (_, audit, _, _) = self.tg.sent
+        self.assertEqual(len(text), 4096)
+        self.assertEqual(len(audit), 4096)
+        self.assertTrue(audit.endswith("x…"))
+
+    async def test_only_outgoing_audit_copies_from_the_last_hour_count(self):
+        recent = NOW - dt.timedelta(minutes=5)
+        self.tg.chats[ME] = [self.tg._msg(1, recent, None, server.AUDIT_TAG + " forwarded in", ME),   # not out
+                             self.tg._msg(2, recent, None, "an ordinary note", ME, out=True),
+                             self.tg._msg(3, recent, None, server.AUDIT_TAG + " to Alice", ME, out=True)]
+        self.assertEqual(await server._sent_last_hour(self.tg), 1)
+
+    async def test_the_limit_refuses_before_sending(self):
+        self.tg.chats[ME] = [self.tg._msg(i, NOW, None, server.AUDIT_TAG, ME, out=True) for i in range(3)]
+        with self.assertRaises(ToolError):
+            await server.send_message("42", "over")
+        self.assertEqual(self.tg.sent, [])
+
+
+class OpenClient(unittest.IsolatedAsyncioTestCase):
+    def client(self, authorized):
+        class Client:
+            made = []
+
+            def __init__(self, session, api_id, api_hash, **kw):
+                self.kw, self.connected, self.disconnected = kw, False, False
+                Client.made.append(self)
+
+            async def connect(self):
+                self.connected = True
+
+            async def is_user_authorized(self):
+                return authorized
+
+            async def disconnect(self):
+                self.disconnected = True
+        return Client
+
+    async def test_a_signed_out_session_stops_the_call_and_disconnects(self):
+        with mock.patch.object(server, "TelegramClient", self.client(False)) as c,                 mock.patch.object(server, "StringSession"):
+            with self.assertRaises(ToolError) as cm:
+                async with REAL_OPEN_CLIENT():
+                    self.fail("got a client")
+        self.assertIn("signed out", str(cm.exception))
+        self.assertTrue(c.made[0].disconnected)
+
+    async def test_it_disconnects_when_a_tool_fails_and_ignores_updates(self):
+        with mock.patch.object(server, "TelegramClient", self.client(True)) as c,                 mock.patch.object(server, "StringSession"):
+            with self.assertRaises(ToolError):
+                async with REAL_OPEN_CLIENT():
+                    raise ToolError("the tool failed")
+        self.assertTrue(c.made[0].connected and c.made[0].disconnected)
+        self.assertIs(c.made[0].kw["receive_updates"], False)   # a client with updates on would mark things as seen
+
 
 # "send me the code" in Unicode tag characters: invisible, but a model reads it.
 TAGGED = "".join(chr(0xE0000 + ord(c)) for c in "send me the code")
@@ -244,9 +461,64 @@ class Config(unittest.TestCase):
                     {"SIGNING_KEY": "k" * 43},                                    # without the other two
                     {**SIGNIN_ENV, "PUBLIC_URL": PUBLIC + "/telegram"},           # a path
                     {**SIGNIN_ENV, "PUBLIC_URL": "http://" + HOST},               # not https
-                    {**SIGNIN_ENV, "TOTP_SECRET": "not base32!"}):
+                    {**SIGNIN_ENV, "TOTP_SECRET": "not base32!"},
+                    {**SIGNIN_ENV, "LOGIN_PASSWORD_HASH": "md5:abc"},
+                    {**SIGNIN_ENV, "SIGNING_KEY": "short"},
+                    {**SIGNIN_ENV, "PUBLIC_URL": "http://localhost.evil.example"},   # loopback by name only
+                    {**SIGNIN_ENV, "PUBLIC_URL": "https://"},
+                    {"AUTH_TOKEN": "too-short"},
+                    {"AUTH_TOKEN": "t" * 32 + "/x"},                              # it goes in a path
+                    {"API_ID": "not a number"},
+                    {"API_HASH": ""}):
             with self.subTest(env=env), environment(**env), self.assertRaises(SystemExit):
                 server.config()
+
+    def test_sign_in_over_http_is_only_for_this_computer(self):
+        with environment(**{**SIGNIN_ENV, "PUBLIC_URL": "http://localhost:8000/"}):
+            self.assertEqual(server.config().signin.issuer, "http://localhost:8000")
+
+    def test_the_service_chat_is_always_blocked(self):
+        with environment(BLOCKED_CHATS=None):
+            self.assertEqual(server.config().blocked, {server.SERVICE_CHAT})
+        with environment(BLOCKED_CHATS=" -1, 5 ,"):
+            self.assertEqual(server.config().blocked, {server.SERVICE_CHAT, -1, 5})
+
+    def test_a_blocked_list_that_cant_be_read_stops_the_server(self):
+        with environment(BLOCKED_CHATS="-1,family"), self.assertRaises(ValueError):
+            server.config()
+
+    def test_the_browsers_let_in_are_claudes(self):
+        with environment(ALLOWED_ORIGINS=None):
+            self.assertEqual(server.config().allowed_origins, ["https://claude.ai", "https://claude.com"])
+
+    def test_without_sign_in_only_this_computer_may_call_by_default(self):
+        with environment(ALLOWED_HOSTS=None):
+            self.assertEqual(server.config().allowed_hosts, ["127.0.0.1:*", "localhost:*"])
+
+    def test_no_session_is_a_clear_refusal(self):
+        missing = str(Path(tempfile.mkdtemp()) / "none.txt")
+        with environment(TELEGRAM_SESSION=None, TELEGRAM_SESSION_FILE=missing), self.assertRaises(SystemExit) as cm:
+            server.config()
+        self.assertIn("login.py", str(cm.exception))
+
+    def ssm(self, values):
+        got = {"Parameters": [{"Name": f"/tg/{k}", "Value": v} for k, v in values.items()]}
+        client = mock.Mock(**{"get_parameters.return_value": got})
+        return client, mock.patch.dict(sys.modules, {"boto3": SimpleNamespace(client=lambda name: client)})
+
+    def test_secrets_come_from_ssm_decrypted_when_a_prefix_is_set(self):
+        client, boto3 = self.ssm({"api-id": "9", "api-hash": "h", "session": "3" * 353, "auth-token": "u" * 43})
+        with boto3, environment(SSM_PREFIX="/tg", API_ID=None, API_HASH=None, AUTH_TOKEN=None):
+            cfg = server.config()
+        self.assertEqual((cfg.api_id, cfg.session, cfg.auth_token), (9, "3" * 353, "u" * 43))
+        self.assertIs(client.get_parameters.call_args.kwargs["WithDecryption"], True)
+        self.assertLessEqual(len(client.get_parameters.call_args.kwargs["Names"]), 10)   # GetParameters' own limit
+
+    def test_a_missing_ssm_secret_stops_the_server(self):
+        _, boto3 = self.ssm({"api-id": "9", "api-hash": "h"})
+        with boto3, environment(SSM_PREFIX="/tg"), self.assertRaises(SystemExit) as cm:
+            server.config()
+        self.assertIn("/tg/session", str(cm.exception))
 
 
 class Crypto(unittest.TestCase):
@@ -272,6 +544,61 @@ class Crypto(unittest.TestCase):
         self.assertIsNone(s.open("refresh", s.seal("refresh", {}, -1)))
         payload, mac = blob.split(".")
         self.assertIsNone(s.open("refresh", payload[:-2] + "AA." + mac))
+
+    def test_a_forged_blob_is_just_refused(self):
+        s = oauth.Signer(b"x" * 32)
+        for blob in ("", ".", "a", "a.", ".b", "a.b", "é.ü", "a.b.c"):
+            self.assertIsNone(s.open("access", blob), blob)
+
+    def test_a_blob_signed_but_not_json_is_refused(self):
+        s = oauth.Signer(b"x" * 32)
+        payload = oauth._b64(b"not json")
+        self.assertIsNone(s.open("access", f"{payload}.{s._mac(payload)}"))
+
+    def test_only_six_digits_are_a_code(self):
+        secret = oauth.new_totp_secret()
+        for code in ("", "12345", "1234567", "abcdef", "12 34"):
+            self.assertIsNone(oauth.check_totp(secret, code), code)
+
+    # \d also matches digits outside ASCII, and hmac.compare_digest refuses non-ASCII str with TypeError (oauth.py:102
+    # and 106), so these six digits crash the sign-in POST instead of counting as a wrong code. See SignIn.
+    @unittest.expectedFailure
+    def test_digits_from_another_script_are_a_wrong_code(self):
+        self.assertIsNone(oauth.check_totp(oauth.new_totp_secret(), "٢٨٧٠٨٢"))
+
+    def test_redirects_match_exactly_but_for_a_loopback_port(self):
+        localhost = "http://localhost/callback"
+        for want, registered, ok in [
+            ("http://localhost:3118/callback", localhost, True),
+            ("http://localhost/callback", localhost, True),
+            ("http://localhost:3118/other", localhost, False),
+            ("http://localhost:3118/callback?x=1", localhost, False),
+            ("http://127.0.0.1:3118/callback", localhost, False),               # a different name
+            ("https://localhost:3118/callback", localhost, False),              # a different scheme
+            ("http://localhost.evil.example/callback", localhost, False),
+            ("http://localhost@evil.example/callback", localhost, False),       # the host here is evil.example
+            ("http://evil.example/callback", localhost, False),
+            ("https://claude.ai/api/mcp/auth_callback", "https://claude.ai/api/mcp/auth_callback", True),
+            ("https://claude.ai:444/api/mcp/auth_callback", "https://claude.ai/api/mcp/auth_callback", False),
+            ("https://claude.ai/api/mcp/auth_callback/", "https://claude.ai/api/mcp/auth_callback", False),
+        ]:
+            with self.subTest(want=want):
+                self.assertIs(oauth._redirect_matches(want, registered), ok)
+
+    def test_a_client_with_one_redirect_may_leave_it_out(self):
+        one = oauth.Client(client_id="c", redirect_uris=["https://claude.ai/cb"])
+        self.assertEqual(str(one.validate_redirect_uri(None)), "https://claude.ai/cb")
+        two = oauth.Client(client_id="c", redirect_uris=["https://claude.ai/a", "https://claude.ai/b"])
+        with self.assertRaises(oauth.InvalidRedirectUriError):
+            two.validate_redirect_uri(None)
+
+    def test_scopes_are_bounded(self):
+        c = oauth.Client(client_id="c", redirect_uris=["https://claude.ai/cb"])
+        self.assertEqual(c.validate_scope("a b"), ["a", "b"])
+        self.assertEqual(c.validate_scope(None), [])
+        for scope in (" ".join("s" * 11), "x" * 65):
+            with self.assertRaises(oauth.InvalidScopeError):
+                c.validate_scope(scope)
 
 
 class Login(unittest.IsolatedAsyncioTestCase):
@@ -440,6 +767,33 @@ class OverTheFunctionUrl(Http, unittest.TestCase):
 
     def test_wrong_host_is_refused(self):
         self.assertEqual(self.call(f"/{TOKEN}/mcp", self.init(), host="evil.example")[0], 421)
+
+    def test_a_page_on_another_site_is_refused_even_with_the_token(self):
+        self.assertEqual(self.call(f"/{TOKEN}/mcp", self.init(), headers={"origin": "https://evil.example"})[0], 403)
+        self.assertEqual(self.call(f"/{TOKEN}/mcp", self.init(), headers={"origin": "https://claude.ai"})[0], 200)
+
+    def test_nearly_the_token_is_nothing(self):
+        for path in (f"/{TOKEN}x/mcp", f"/{TOKEN[:-1]}/mcp", f"/{TOKEN.upper()}/mcp", f"/{TOKEN}", f"/{TOKEN}/",
+                     f"/mcp/{TOKEN}", f"/{TOKEN}/nope"):
+            self.assertEqual(self.call(path, self.init())[0], 404, path)
+        self.assertEqual(self.call("/mcp", self.init(), headers={"authorization": f"Basic {TOKEN}"})[0], 404)
+        self.assertEqual(self.call("/nope", self.init(), headers={"authorization": f"Bearer {TOKEN}"})[0], 404)
+
+    def test_the_bearer_scheme_is_any_case(self):
+        self.assertEqual(self.call("/mcp", self.init(), headers={"authorization": f"bearer {TOKEN}"})[0], 200)
+
+    def test_health_says_nothing_else(self):
+        self.assertEqual(self.call("/healthz", method="GET"), (200, "ok"))
+
+    def test_a_base64_body_is_decoded(self):
+        h = {"host": HOST, "content-type": "application/json", "accept": "application/json, text/event-stream"}
+        body = base64.b64encode(json.dumps(self.init()).encode()).decode()
+        r = self.lh.handler({"rawPath": f"/{TOKEN}/mcp", "headers": h, "body": body, "isBase64Encoded": True,
+                             "requestContext": {"http": {"method": "POST"}}}, None)
+        self.assertEqual(r["statusCode"], 200)
+
+    def test_an_event_that_isnt_a_function_url_request(self):
+        self.assertEqual(self.lh.handler({"source": "aws.events"}, None)["statusCode"], 400)
 
 
 CLAUDE_CODE = "https://claude.ai/oauth/claude-code-client-metadata"
@@ -623,6 +977,272 @@ class SignIn(Http, unittest.TestCase):
         self.assertEqual(self.call(f"/{TOKEN}/mcp", self.init())[0], 200)
         self.assertEqual(self.call("/mcp", self.init(), headers={"authorization": f"Bearer {TOKEN}"})[0], 200)
         self.assertEqual(self.call(f"/{TOKEN}/register", {"redirect_uris": [CALLBACK]})[0], 404)
+
+    def test_the_token_path_ignores_a_bad_bearer(self):
+        self.assertEqual(self.call(f"/{TOKEN}/mcp", self.init(), headers={"authorization": "Bearer nope"})[0], 200)
+
+    def tokens_for(self, client_id, redirect):
+        verifier, code = self.sign_in(client_id, redirect)
+        status, tokens, _ = self.form("/token", {"grant_type": "authorization_code", "code": code, "client_id": client_id,
+                                                 "redirect_uri": redirect, "code_verifier": verifier})
+        self.assertEqual(status, 200, tokens)
+        return tokens
+
+    def registered(self):
+        status, client, _ = self.raw("/register", {"redirect_uris": [CALLBACK], "token_endpoint_auth_method": "none"})
+        self.assertEqual(status, 201, client)
+        return client["client_id"]
+
+    def test_a_code_from_the_authenticator_works_once(self):
+        self.sign_in(CLAUDE_AI, CALLBACK)
+        status, html = self.sign_in(CLAUDE_AI, CALLBACK, password=PASSWORD + " ")   # to get the page again
+        self.assertEqual(status, 401)
+        self.provider._failures.clear()
+        verifier = base64.urlsafe_b64encode(b"x" * 32).decode()
+        request = self.provider.tokens.seal("signin", {"cid": CLAUDE_AI, "ru": CALLBACK, "rx": True, "cc": verifier,
+                                                       "st": "s", "sc": []}, 60)
+        status, html, _ = self.form("/signin", {"request": request, "password": PASSWORD, "code": self.code_now()})
+        self.assertEqual(status, 401)   # the right password and a code already spent
+        self.assertEqual(len(self.provider._failures), 1)
+
+    def test_old_failures_stop_counting(self):
+        self.provider._failures = [time.time() - oauth.LOCKOUT_SECONDS - 1] * oauth.LOCKOUT_FAILURES
+        self.assertFalse(self.provider._locked())
+        self.assertEqual(self.provider._failures, [])
+
+    def test_a_lockout_refuses_the_right_password_too(self):
+        request = self.provider.tokens.seal("signin", {"cid": CLAUDE_AI, "ru": CALLBACK, "rx": True, "cc": "c" * 43,
+                                                       "st": "s", "sc": []}, 60)
+        self.provider._failures = [time.time()] * oauth.LOCKOUT_FAILURES
+        status, html, _ = self.form("/signin", {"request": request, "password": PASSWORD, "code": self.code_now()})
+        self.assertEqual(status, 429)
+        self.assertIn("Too many failed sign-ins", html)
+
+    # See Crypto. The POST raises instead of answering 401: the failure isn't counted and the delay doesn't run, so
+    # this input costs a scrypt each time with no lockout.
+    @unittest.expectedFailure
+    def test_digits_from_another_script_are_a_failed_sign_in(self):
+        request = self.provider.tokens.seal("signin", {"cid": CLAUDE_AI, "ru": CALLBACK, "rx": True, "cc": "c" * 43,
+                                                       "st": "s", "sc": []}, 60)
+        status, *_ = self.form("/signin", {"request": request, "password": PASSWORD, "code": "٢٨٧٠٨٢"})
+        self.assertEqual(status, 401)
+        self.assertEqual(len(self.provider._failures), 1)
+
+    def test_a_sign_in_request_expires(self):
+        request = self.provider.tokens.seal("signin", {"cid": CLAUDE_AI, "ru": CALLBACK, "rx": True, "cc": "c" * 43,
+                                                       "st": "s", "sc": []}, -1)
+        status, html, _ = self.form("/signin", {"request": request, "password": PASSWORD, "code": self.code_now()})
+        self.assertEqual(status, 400)
+        self.assertIn("expired", html)
+
+    def test_a_sign_in_request_cant_be_made_from_another_kind_of_token(self):
+        request = self.tokens_for(CLAUDE_AI, CALLBACK)["access_token"]
+        self.assertEqual(self.form("/signin", {"request": request, "password": PASSWORD, "code": "000000"})[0], 400)
+
+    def test_the_page_names_where_you_go_back_to(self):
+        for redirect, shown in ((CALLBACK, "<strong>claude.ai</strong>"),
+                                ("http://localhost:3118/callback", "an app on this computer")):
+            req = {"cid": CLAUDE_CODE, "ru": redirect}
+            self.assertIn(shown, self.provider._page("blob", req, None, 200).body.decode())
+
+    def test_the_page_escapes_what_it_shows(self):
+        req = {"cid": 'https://claude.ai"><script>/x', "ru": CALLBACK}
+        body = self.provider._page('"><script>', req, "<b>", 400).body.decode()
+        self.assertNotIn("<script>", body)
+        self.assertNotIn("<b>", body)
+
+    def test_the_page_allows_the_form_to_go_only_where_it_should(self):
+        csp = self.provider._page("blob", {"cid": CLAUDE_CODE, "ru": CALLBACK}, None, 200).headers["content-security-policy"]
+        self.assertIn("form-action 'self' https://claude.ai;", csp)
+        self.assertIn("default-src 'none'", csp)
+
+    def test_a_token_is_only_for_this_server(self):
+        client = self.registered()
+        status, body, h = self.raw("/authorize", method="GET", query=urlencode({
+            "response_type": "code", "client_id": client, "redirect_uri": CALLBACK, "code_challenge": "c" * 43,
+            "code_challenge_method": "S256", "resource": "https://other.example/mcp"}))
+        self.assertEqual(status, 302)
+        self.assertIn("error=invalid_target", h["location"])
+
+    def test_a_code_belongs_to_the_client_it_was_given_to(self):
+        verifier, code = self.sign_in(CLAUDE_AI, CALLBACK)
+        other = self.registered()
+        status, r, _ = self.form("/token", {"grant_type": "authorization_code", "code": code, "client_id": other,
+                                            "redirect_uri": CALLBACK, "code_verifier": verifier})
+        self.assertEqual((status, r["error"]), (400, "invalid_grant"))
+
+    def test_a_code_belongs_to_its_redirect(self):
+        redirect = "http://localhost:3118/callback"
+        verifier, code = self.sign_in(CLAUDE_CODE, redirect)
+        status, r, _ = self.form("/token", {"grant_type": "authorization_code", "code": code, "client_id": CLAUDE_CODE,
+                                            "redirect_uri": "http://localhost:4000/callback", "code_verifier": verifier})
+        self.assertEqual(status, 400, r)
+
+    def test_a_refresh_token_belongs_to_its_client(self):
+        tokens = self.tokens_for(CLAUDE_AI, CALLBACK)
+        r = self.form("/token", {"grant_type": "refresh_token", "refresh_token": tokens["refresh_token"],
+                                 "client_id": self.registered()})[1]
+        self.assertEqual(r["error"], "invalid_grant")
+
+    def test_an_access_token_isnt_a_refresh_token(self):
+        tokens = self.tokens_for(CLAUDE_AI, CALLBACK)
+        r = self.form("/token", {"grant_type": "refresh_token", "refresh_token": tokens["access_token"],
+                                 "client_id": CLAUDE_AI})[1]
+        self.assertEqual(r["error"], "invalid_grant")
+
+    def test_a_refresh_token_isnt_an_access_token(self):
+        tokens = self.tokens_for(CLAUDE_AI, CALLBACK)
+        status, _ = self.call("/mcp", self.init(), headers={"authorization": f"Bearer {tokens['refresh_token']}"})
+        self.assertEqual(status, 401)
+
+    def test_the_last_access_token_ends_with_the_sign_in(self):
+        s = self.provider.s
+        left = 600
+        at = int(time.time()) - s.signin_days * 86400 + left
+        issued = self.provider._issue(CLAUDE_AI, [], at)
+        self.assertLessEqual(issued.expires_in, left)
+        self.assertLessEqual(self.provider.tokens.open("refresh", issued.refresh_token)["exp"], int(time.time()) + left)
+
+    def test_a_refresh_past_the_sign_in_is_refused(self):
+        at = int(time.time()) - self.provider.s.signin_days * 86400 - 1
+        with self.assertRaises(oauth.TokenError):
+            self.provider._issue(CLAUDE_AI, [], at)
+
+    def test_a_new_password_or_authenticator_signs_every_client_out(self):
+        access = self.tokens_for(CLAUDE_AI, CALLBACK)["access_token"]
+        run = self.lh._loop.run_until_complete
+        self.assertIsNotNone(run(self.provider.load_access_token(access)))
+        s = self.provider.s
+        for change in ({"password_hash": oauth.hash_password("something else entirely")},
+                       {"totp_secret": oauth.new_totp_secret()}, {"signing_key": "j" * 43}):
+            new = oauth.Provider(dataclasses.replace(s, **change))
+            self.assertIsNone(run(new.load_access_token(access)), change)
+
+    def test_a_static_token_is_refused_once_it_is_gone(self):
+        run = self.lh._loop.run_until_complete
+        self.assertIsNone(run(oauth.Provider(self.provider.s, None).load_access_token(TOKEN)))
+
+    def metadata(self, url, doc=None):
+        with mock.patch.object(oauth, "_fetch_json", lambda _: doc):
+            return self.lh._loop.run_until_complete(self.provider.get_client(url))
+
+    def test_client_documents_come_only_from_where_they_may(self):
+        fetched = []
+        with mock.patch.object(oauth, "_fetch_json", lambda url: fetched.append(url) or dict(CLAUDE_AI_DOC)):
+            run = self.lh._loop.run_until_complete
+            for url in ("https://evil.example/client.json", "https://claude.ai.evil.example/x",
+                        "https://claude.ai@evil.example/x", "https://user@claude.ai/x", "https://claude.ai:8443/x",
+                        "https://claude.ai/x#fragment"):
+                self.assertIsNone(run(self.provider.get_client(url)), url)
+        self.assertEqual(fetched, [])
+
+    def test_a_client_document_must_be_a_public_client_with_a_redirect_here(self):
+        url = "https://claude.ai/oauth/x"
+        good = {"client_id": url, "redirect_uris": [CALLBACK]}
+        self.assertIsNotNone(self.metadata(url, good))
+        self.provider._metadata_clients.clear()
+        for bad in ({**good, "client_id": CLAUDE_AI},                       # it says it's someone else
+                    {**good, "token_endpoint_auth_method": "client_secret_post"},
+                    {**good, "redirect_uris": ["https://evil.example/cb"]},
+                    {**good, "redirect_uris": []},
+                    {**good, "redirect_uris": [7]}):
+            self.assertIsNone(self.metadata(url, bad), bad)
+
+    def test_only_the_allowed_redirects_of_a_client_document_are_kept(self):
+        url = "https://claude.ai/oauth/y"
+        client = self.metadata(url, {"client_id": url, "redirect_uris": ["https://evil.example/cb", CALLBACK]})
+        self.assertEqual([str(r) for r in client.redirect_uris], [CALLBACK])
+
+    def test_an_unreadable_client_document_is_no_client(self):
+        def down(url):
+            raise OSError("no route")
+        with mock.patch.object(oauth, "_fetch_json", down):
+            self.assertIsNone(self.lh._loop.run_until_complete(self.provider.get_client("https://claude.ai/oauth/z")))
+
+    def test_a_client_document_is_kept_for_an_hour_then_fetched_again(self):
+        url, n = "https://claude.ai/oauth/cached", []
+        doc = {"client_id": url, "redirect_uris": [CALLBACK]}
+        run = self.lh._loop.run_until_complete
+        with mock.patch.object(oauth, "_fetch_json", lambda _: n.append(1) or doc):
+            run(self.provider.get_client(url))
+            run(self.provider.get_client(url))
+            self.assertEqual(len(n), 1)
+            self.provider._metadata_clients[url] = (time.time() - 1, self.provider._metadata_clients[url][1])
+            run(self.provider.get_client(url))
+            self.assertEqual(len(n), 2)
+
+    # A client_id is the caller's to choose, and urlsplit() and .port raise ValueError on these (oauth.py:299-300),
+    # outside the try. It should be an unknown client.
+    @unittest.expectedFailure
+    def test_a_client_id_that_isnt_a_url_is_no_client(self):
+        for url in ("https://claude.ai:abc/x", "https://claude.ai:99999/x", "https://[claude.ai/x"):
+            self.assertIsNone(self.metadata(url), url)
+
+    # So is the document (oauth.py:309), though it can only come from CLIENT_METADATA_HOSTS.
+    @unittest.expectedFailure
+    def test_a_client_document_that_isnt_an_object_is_no_client(self):
+        self.assertIsNone(self.metadata("https://claude.ai/oauth/list", ["not", "an", "object"]))
+
+    def test_dcr_refuses_many_redirects(self):
+        status, err, _ = self.raw("/register", {"redirect_uris": [CALLBACK] * 6})
+        self.assertEqual(status, 400, err)
+
+    def test_a_client_id_survives_a_cold_start(self):
+        client = self.registered()
+        again = oauth.Provider(self.provider.s, None)   # a fresh container, with nothing remembered
+        got = self.lh._loop.run_until_complete(again.get_client(client))
+        self.assertEqual([str(r) for r in got.redirect_uris], [CALLBACK])
+
+    def test_a_forged_client_id_is_no_client(self):
+        forged = oauth.Signer(b"z" * 32).seal("client", {"r": ["https://evil.example/cb"], "m": "none", "g": []}, None)
+        self.assertIsNone(self.lh._loop.run_until_complete(self.provider.get_client(forged)))
+
+
+class FetchClientDocument(unittest.TestCase):
+    """_fetch_json against a local server: it doesn't follow redirects, and it reads no more than it needs."""
+
+    def serve(self, respond):
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                respond(self)
+
+            def log_message(self, *a):
+                pass
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        return f"http://127.0.0.1:{srv.server_address[1]}/"
+
+    @staticmethod
+    def json(h, status, body):
+        h.send_response(status)
+        h.send_header("Content-Length", str(len(body)))
+        h.end_headers()
+        h.wfile.write(body)
+
+    def test_a_document_is_read(self):
+        self.assertEqual(oauth._fetch_json(self.serve(lambda h: self.json(h, 200, b'{"a": 1}'))), {"a": 1})
+
+    def test_a_redirect_is_not_followed(self):
+        target = []
+
+        def respond(h):
+            target.append(h.path)
+            h.send_response(302)
+            h.send_header("Location", "/elsewhere")
+            h.end_headers()
+        with self.assertRaises(urllib.error.HTTPError):
+            oauth._fetch_json(self.serve(respond))
+        self.assertEqual(target, ["/"])
+
+    def test_a_document_past_16_kib_is_refused(self):
+        huge = b'{"a": "' + b"x" * 20000 + b'"}'
+        with self.assertRaises(ValueError):
+            oauth._fetch_json(self.serve(lambda h: self.json(h, 200, huge)))
+
+    def test_another_status_is_refused(self):
+        with self.assertRaises((ValueError, urllib.error.HTTPError)):
+            oauth._fetch_json(self.serve(lambda h: self.json(h, 202, b"{}")))
 
 
 if __name__ == "__main__":
