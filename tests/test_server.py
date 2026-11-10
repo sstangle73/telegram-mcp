@@ -1,4 +1,5 @@
 """The guards and the HTTP path, against a fake Telegram: python -m unittest discover -s tests"""
+import asyncio
 import base64
 import dataclasses
 import datetime as dt
@@ -1017,6 +1018,34 @@ class SignIn(Http, unittest.TestCase):
         status, html, _ = self.form("/signin", {"request": request, "password": PASSWORD, "code": self.code_now()})
         self.assertEqual(status, 429)
         self.assertIn("Too many failed sign-ins", html)
+
+    def test_parallel_wrong_sign_ins_respect_the_lockout(self):
+        """Wrong guesses sent at once are checked one at a time: only LOCKOUT_FAILURES are evaluated, the rest get 429."""
+        request = self.provider.tokens.seal("signin", {"cid": CLAUDE_AI, "ru": CALLBACK, "rx": True, "cc": "c" * 43,
+                                                       "st": "s", "sc": []}, 60)
+        checked = []
+
+        def check(password, stored):
+            checked.append(password)
+            time.sleep(0.01)
+            return False
+
+        class Post:
+            method = "POST"
+
+            async def form(self):
+                return {"request": request, "password": "wrong", "code": "000000"}
+
+        async def burst():
+            return await asyncio.gather(*(self.provider.signin(Post()) for _ in range(oauth.LOCKOUT_FAILURES + 5)))
+        self.provider.fail_delay = 0.01
+        try:
+            with mock.patch.object(oauth, "check_password", check):
+                responses = self.lh._loop.run_until_complete(burst())
+        finally:
+            self.provider.fail_delay = 0
+        self.assertEqual(len(checked), oauth.LOCKOUT_FAILURES)
+        self.assertEqual(sorted(r.status_code for r in responses), [401] * oauth.LOCKOUT_FAILURES + [429] * 5)
 
     # See Crypto. The POST raises instead of answering 401: the failure isn't counted and the delay doesn't run, so
     # this input costs a scrypt each time with no lockout.

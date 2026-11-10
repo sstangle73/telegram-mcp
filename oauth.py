@@ -245,6 +245,7 @@ class Provider:
         self._metadata_clients: dict[str, tuple[float, Client]] = {}
         self._used: dict[str, float] = {}
         self._failures: list[float] = []
+        self._signin_lock = asyncio.Lock()
 
     def auth_settings(self) -> AuthSettings:
         return AuthSettings(issuer_url=self.s.issuer, resource_server_url=self.s.resource, validate_token_resource=True,
@@ -421,15 +422,18 @@ class Provider:
                               400)
         if request.method == "GET":
             return self._page(blob, req, None, 200)
-        if self._locked():
-            return self._page(blob, req, "Too many failed sign-ins. Try again in 15 minutes.", 429)
-        ok = await asyncio.to_thread(check_password, str(form.get("password") or ""), self.s.password_hash)
-        step = check_totp(self.s.totp_secret, str(form.get("code") or ""))
-        if not ok or step is None or not self._use(f"totp:{step}", time.time() + 120):
-            self._failures.append(time.time())
-            log.warning("failed sign-in (%d in the last 15 minutes)", len(self._failures))
-            await asyncio.sleep(self.fail_delay)
-            return self._page(blob, req, "Wrong password or code.", 401)
+        # One attempt at a time, failure delay included, so parallel guesses can't all pass the lockout check before
+        # any of them is counted.
+        async with self._signin_lock:
+            if self._locked():
+                return self._page(blob, req, "Too many failed sign-ins. Try again in 15 minutes.", 429)
+            ok = await asyncio.to_thread(check_password, str(form.get("password") or ""), self.s.password_hash)
+            step = check_totp(self.s.totp_secret, str(form.get("code") or ""))
+            if not ok or step is None or not self._use(f"totp:{step}", time.time() + 120):
+                self._failures.append(time.time())
+                log.warning("failed sign-in (%d in the last 15 minutes)", len(self._failures))
+                await asyncio.sleep(self.fail_delay)
+                return self._page(blob, req, "Wrong password or code.", 401)
         code = self.tokens.seal("code", {"cid": req["cid"], "ru": req["ru"], "rx": req["rx"], "cc": req["cc"],
                                          "sc": req["sc"], "at": int(time.time()), "jti": secrets.token_urlsafe(9)},
                                 CODE_SECONDS)
